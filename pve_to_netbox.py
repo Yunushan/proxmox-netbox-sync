@@ -483,7 +483,28 @@ def ensure_vm_interface_and_ips(
 
     for ip, prefix, family in ips:
         cidr = f"{ip}/{prefix}"
-        ip_obj = nb.ipam.ip_addresses.get(address=cidr)
+        ip_obj = None
+
+        # Try exact address match (may return multiple if duplicates exist)
+        exact_candidates = list(nb.ipam.ip_addresses.filter(address=cidr))
+        if exact_candidates:
+            # Prefer one already on this interface, otherwise take the first
+            ip_obj = next(
+                (
+                    c
+                    for c in exact_candidates
+                    if getattr(c, "assigned_object_type", None) == "virtualization.vminterface"
+                    and getattr(c, "assigned_object_id", None) == iface.id
+                ),
+                exact_candidates[0],
+            )
+            if len(exact_candidates) > 1:
+                LOG.warning(
+                    "IP %s has %d records in NetBox; using id=%s and leaving others untouched",
+                    cidr,
+                    len(exact_candidates),
+                    ip_obj.id,
+                )
 
         # If not found with exact prefix, try to find any IP with the same host part
         if not ip_obj:
