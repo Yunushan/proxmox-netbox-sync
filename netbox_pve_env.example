@@ -1,0 +1,20 @@
+# Copy this file to netbox_pve_env.sh and fill values
+
+# Proxmox
+export PVE_HOST="192.168.0.12"
+export PVE_USER="netsync@pve"
+export PVE_TOKEN_NAME="sync"
+export PVE_TOKEN_VALUE="YOUR_TOKEN_HERE"
+export PVE_VERIFY_SSL="false"
+
+# Netbox
+export NB_URL="https://netbox.example.com"
+export NB_TOKEN="YOUR_NETBOX_TOKEN"
+export NB_VERIFY_SSL="false"
+
+# NetBox objects
+export NB_CLUSTER_SLUG="pve-cluster"
+export NB_SITE_SLUG="lab"
+export NB_DEVICE_ROLE_SLUG="hypervisor"
+export NB_DEVICE_TYPE_SLUG="proxmox-node"
+

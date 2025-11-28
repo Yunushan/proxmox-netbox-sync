@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Proxmox -> NetBox sync periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=pve-netbox-sync.service
+
+[Install]
+WantedBy=timers.target
+

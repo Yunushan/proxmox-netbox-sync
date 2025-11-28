@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync Proxmox VMs and nodes to NetBox
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/netbox-sync
+# Run through bash so we can 'source' your env file with exports
+ExecStart=/bin/bash -lc 'cd /root/netbox-sync && source netbox_pve_env.sh && venv/bin/python3 pve_to_netbox.py'
+
