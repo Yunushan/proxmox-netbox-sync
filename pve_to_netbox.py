@@ -531,7 +531,21 @@ def ensure_vm_interface_and_ips(
 
         # If not found with exact prefix, try to find any IP with the same host part
         if not ip_obj:
-            candidates = nb.ipam.ip_addresses.filter(q=ip)
+            candidates = []
+            try:
+                candidates = list(nb.ipam.ip_addresses.filter(q=ip))
+            except RequestError as exc:
+                status = getattr(getattr(exc, "req", None), "status_code", None)
+                if status and 500 <= status < 600:
+                    LOG.warning(
+                        "NetBox returned %s while searching for IP host %s; skipping host match",
+                        status,
+                        ip,
+                    )
+                    candidates = []
+                else:
+                    raise
+
             for candidate in candidates:
                 addr = getattr(candidate, "address", "")
                 if addr and addr.split("/")[0] == ip:
