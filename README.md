@@ -32,6 +32,21 @@ pip install proxmoxer pynetbox requests
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
    - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
 
+## Required API permissions
+
+- **NetBox API token** (user or token-scoped permissions):
+  - Virtualization: read/write `clusters`, `virtual-machines`, `interfaces`.
+  - IPAM: read/write `ip-addresses`, `vlans`.
+  - DCIM: read/write `sites`, `devices`, `device-roles`, `device-types`.
+  - If you prefer read-only sites/roles/types, grant read on those and write on the objects the tool creates/updates (VMs, interfaces, IPs, VLANs, devices).
+
+- **Proxmox API user/token** (recommended: dedicated service account with a custom role):
+  - Minimum privileges: `VM.Audit`, `VM.Monitor` (to call guest-agent), `VM.Config.Options` (to read NIC config), `Sys.Audit` (to list nodes).
+  - A simple approach: clone `PVEAuditor` and add `VM.Monitor` so guest-agent calls succeed, then assign that role to the token on the relevant nodes (or cluster-wide).
+
+- **Proxmox guest agent inside VMs**:
+  - Install and enable `qemu-guest-agent` so IP discovery works. Without it, VMs are still synced but IPs remain empty.
+
 ## Run once (manual)
 
 ```bash
