@@ -6,6 +6,7 @@ from typing import Dict, Optional, List, Tuple
 import requests
 from proxmoxer import ProxmoxAPI
 import pynetbox
+from pynetbox.core.query import RequestError
 
 
 LOG = logging.getLogger("pve_to_netbox")
@@ -484,16 +485,35 @@ def ensure_vm_interface_and_ips(
         cidr = f"{ip}/{prefix}"
         ip_obj = nb.ipam.ip_addresses.get(address=cidr)
 
+        # If not found with exact prefix, try to find any IP with the same host part
+        if not ip_obj:
+            candidates = nb.ipam.ip_addresses.filter(q=ip)
+            for candidate in candidates:
+                addr = getattr(candidate, "address", "")
+                if addr and addr.split("/")[0] == ip:
+                    ip_obj = candidate
+                    break
+
         if not ip_obj:
             LOG.info("Creating IP %s and assigning to %s", cidr, iface_name)
-            ip_obj = nb.ipam.ip_addresses.create(
-                {
-                    "address": cidr,
-                    "status": "active",
-                    "assigned_object_type": "virtualization.vminterface",
-                    "assigned_object_id": iface.id,
-                }
-            )
+            try:
+                ip_obj = nb.ipam.ip_addresses.create(
+                    {
+                        "address": cidr,
+                        "status": "active",
+                        "assigned_object_type": "virtualization.vminterface",
+                        "assigned_object_id": iface.id,
+                    }
+                )
+            except RequestError as exc:
+                err_str = str(getattr(exc, "error", exc))
+                if "Duplicate IP address" in err_str:
+                    LOG.warning(
+                        "IP %s already exists in NetBox; leaving existing assignment untouched",
+                        cidr,
+                    )
+                    continue
+                raise
         else:
             # If it already exists, only touch it if it's already attached to this iface.
             ao_type = getattr(ip_obj, "assigned_object_type", None)
