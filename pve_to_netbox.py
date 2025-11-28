@@ -2,6 +2,7 @@
 import os
 import logging
 import ipaddress
+import re
 from typing import Dict, Optional, List, Tuple
 
 import requests
@@ -119,6 +120,15 @@ def bytes_to_mb(value: int) -> int:
 
 def bytes_to_gb(value: int) -> int:
     return int(round(value / (1024 * 1024 * 1024))) if value is not None else 0
+
+
+def size_to_mb_decimal(value: float, unit: str) -> int:
+    """
+    Convert a size with unit (K/M/G/T) to MB using decimal (1000) multiplier.
+    """
+    unit = unit.upper()
+    multipliers = {"K": 1 / 1000, "M": 1, "G": 1000, "T": 1000 * 1000}
+    return int(round(value * multipliers.get(unit, 1)))
 
 
 def map_vm_status(pve_status: str) -> str:
@@ -299,6 +309,72 @@ def fetch_guest_ips(
             ips.append((ip, int(prefix), family))
 
     return ips
+
+
+# ---------------------------------------------------------------------------
+# Disk size helpers
+# ---------------------------------------------------------------------------
+
+DISK_KEY_PREFIXES = ("scsi", "sata", "virtio", "ide", "efidisk", "unused")
+
+
+def parse_disk_sizes_from_config(config: dict) -> int:
+    """
+    Parse disk sizes from Proxmox VM/LXC config strings and return total MB (decimal).
+    """
+    total_mb = 0
+    size_re = re.compile(r"size=([\d.]+)([KMGTP])", re.IGNORECASE)
+
+    for key, value in config.items():
+        key_l = str(key).lower()
+        if not key_l.startswith(DISK_KEY_PREFIXES):
+            continue
+        if not isinstance(value, str):
+            continue
+
+        match = size_re.search(value)
+        if not match:
+            continue
+        amount = float(match.group(1))
+        unit = match.group(2)
+        total_mb += size_to_mb_decimal(amount, unit)
+
+    return int(total_mb)
+
+
+def get_vm_disk_mb(proxmox: ProxmoxAPI, node_name: str, vmid: int, pve_type: str, vm: dict) -> int:
+    """
+    Determine VM disk size in MB (decimal). Prefer config parsing; fall back to maxdisk.
+    """
+    config = {}
+    try:
+        if pve_type == "qemu":
+            config = proxmox.nodes(node_name).qemu(vmid).config.get()
+        elif pve_type == "lxc":
+            config = proxmox.nodes(node_name).lxc(vmid).config.get()
+    except Exception as exc:
+        LOG.debug("Failed to fetch config for disk sizing (vmid=%s): %s", vmid, exc)
+
+    total_mb = parse_disk_sizes_from_config(config) if config else 0
+    if total_mb > 0:
+        LOG.debug("Disk size for vmid=%s from config: %s MB", vmid, total_mb)
+        return total_mb
+
+    maxdisk = vm.get("maxdisk") or 0
+    if not maxdisk and config:
+        maxdisk = config.get("maxdisk", 0)
+    if not maxdisk:
+        try:
+            status = {}
+            if pve_type == "qemu":
+                status = proxmox.nodes(node_name).qemu(vmid).status.current.get()
+            elif pve_type == "lxc":
+                status = proxmox.nodes(node_name).lxc(vmid).status.current.get()
+            maxdisk = status.get("maxdisk", 0)
+        except Exception as exc:
+            LOG.debug("Failed to fetch status.current for disk sizing (vmid=%s): %s", vmid, exc)
+
+    return bytes_to_mb(maxdisk)
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +793,7 @@ def sync_single_vm(
         or 1
     )
     memory_mb = bytes_to_mb(vm.get("maxmem", 0))
-    disk_mb = bytes_to_mb(vm.get("maxdisk", 0))  # NetBox expects MB
+    disk_mb = get_vm_disk_mb(proxmox, node_name, vmid, pve_type, vm)  # decimal MB
 
     status_slug = map_vm_status(pve_status)
 
@@ -745,9 +821,10 @@ def sync_single_vm(
             "status": status_slug,
             "vcpus": vcpus,
             "memory": memory_mb,
-            "disk": disk_mb,
             "comments": comments,
         }
+        if disk_mb:
+            create_data["disk"] = disk_mb
         if site:
             create_data["site"] = site.id
         if host_device:
@@ -765,6 +842,19 @@ def sync_single_vm(
             nb_vm.site = site
         if host_device:
             nb_vm.device = host_device
+
+        # Align disk with existing virtual disks if present; otherwise use computed.
+        try:
+            nb_disks = list(nb.virtualization.virtual_disks.filter(virtual_machine_id=nb_vm.id))
+            nb_disk_sum = sum(int(getattr(d, "size", 0) or 0) for d in nb_disks)
+        except Exception as exc:
+            LOG.debug("Failed to fetch NetBox virtual disks for vm %s: %s", nb_vm.id, exc)
+            nb_disk_sum = 0
+
+        target_disk_mb = nb_disk_sum or disk_mb
+        if target_disk_mb and (nb_vm.disk or 0) != target_disk_mb:
+            nb_vm.disk = target_disk_mb
+
         nb_vm.save()
 
     # Interface + IP handling
