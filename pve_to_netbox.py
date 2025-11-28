@@ -557,6 +557,14 @@ def ensure_vm_interface_and_ips(
                         cidr,
                     )
                     continue
+                status = getattr(getattr(exc, "req", None), "status_code", None)
+                if status and 500 <= status < 600:
+                    LOG.warning(
+                        "NetBox returned %s while creating IP %s; skipping this IP and continuing",
+                        status,
+                        cidr,
+                    )
+                    continue
                 raise
         else:
             # If it already exists, only touch it if it's already attached to this iface.
