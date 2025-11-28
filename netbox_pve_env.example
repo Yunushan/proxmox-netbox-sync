@@ -1,20 +1,20 @@
 # Copy this file to netbox_pve_env.sh and fill values
 
 # Proxmox
-export PVE_HOST="192.168.0.12"
-export PVE_USER="netsync@pve"
-export PVE_TOKEN_NAME="sync"
-export PVE_TOKEN_VALUE="YOUR_TOKEN_HERE"
-export PVE_VERIFY_SSL="false"
+export PVE_HOST="192.168.0.12"        # Proxmox node hostname/IP
+export PVE_USER="netsync@pve"         # Proxmox API user (realm @pve)
+export PVE_TOKEN_NAME="sync"          # Proxmox API token ID
+export PVE_TOKEN_VALUE="YOUR_TOKEN_HERE"  # Proxmox API token secret
+export PVE_VERIFY_SSL="false"         # Set true to verify TLS certs
 
 # Netbox
-export NB_URL="https://netbox.example.com"
-export NB_TOKEN="YOUR_NETBOX_TOKEN"
-export NB_VERIFY_SSL="false"
+export NB_URL="https://netbox.example.com"   # NetBox base URL
+export NB_TOKEN="YOUR_NETBOX_TOKEN"          # NetBox API token
+export NB_VERIFY_SSL="false"                 # Set true to verify TLS certs
 
 # NetBox objects
-export NB_CLUSTER_SLUG="pve-cluster"
-export NB_SITE_SLUG="lab"
-export NB_DEVICE_ROLE_SLUG="hypervisor"
-export NB_DEVICE_TYPE_SLUG="proxmox-node"
+export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slug
+export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices)
+export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
+export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
 
