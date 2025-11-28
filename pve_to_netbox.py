@@ -673,7 +673,6 @@ def sync_single_vm(
         nb_vm.status = status_slug
         nb_vm.vcpus = vcpus
         nb_vm.memory = memory_mb
-        nb_vm.disk = disk_mb
         nb_vm.comments = comments
         nb_vm.cluster = cluster
         if site:
