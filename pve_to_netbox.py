@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import logging
+import ipaddress
 from typing import Dict, Optional, List, Tuple
 
 import requests
@@ -484,6 +485,28 @@ def ensure_vm_interface_and_ips(
     for ip, prefix, family in ips:
         cidr = f"{ip}/{prefix}"
         ip_obj = None
+
+        # Skip network or broadcast addresses; NetBox rejects these on interfaces
+        try:
+            ip_addr = ipaddress.ip_address(ip)
+            network = ipaddress.ip_network(cidr, strict=False)
+            is_network = ip_addr == network.network_address
+            is_broadcast = (
+                isinstance(network, ipaddress.IPv4Network)
+                and ip_addr == network.broadcast_address
+                and network.num_addresses > 1
+            )
+            if is_network or is_broadcast:
+                LOG.warning(
+                    "IP %s appears to be a %s address; skipping assignment to %s",
+                    cidr,
+                    "network" if is_network else "broadcast",
+                    iface_name,
+                )
+                continue
+        except ValueError as exc:
+            LOG.warning("Invalid IP %s (%s); skipping", cidr, exc)
+            continue
 
         # Try exact address match (may return multiple if duplicates exist)
         exact_candidates = list(nb.ipam.ip_addresses.filter(address=cidr))
