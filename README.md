@@ -31,6 +31,12 @@ pip install proxmoxer pynetbox requests
    - `NB_URL`, `NB_TOKEN`, `NB_VERIFY_SSL`
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
    - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
+   - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
+
+### Sync modes
+
+- **Safe update** (default / `PVE_NB_SYNC_MODE=1`): Creates/updates VMs, interfaces, IPs. Nothing is removed from NetBox.
+- **Full sync** (`PVE_NB_SYNC_MODE=2`): After syncing, deletes NetBox VMs in the target cluster that are not present in Proxmox. Matching is name-based but also vmid-aware (vmid is stored in comments) to avoid deleting renamed VMs/templates.
 
 ## Required API permissions
 
