@@ -12,6 +12,10 @@ export NB_URL="https://netbox.example.com"   # NetBox base URL
 export NB_TOKEN="YOUR_NETBOX_TOKEN"          # NetBox API token
 export NB_VERIFY_SSL="false"                 # Set true to verify TLS certs
 
+# Sync mode (1/safe = no deletions, 2/full = delete NetBox VMs missing in Proxmox)
+# Leave blank to be prompted when running interactively.
+export PVE_NB_SYNC_MODE=""
+
 # NetBox objects
 export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slug
 export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices)

@@ -3,7 +3,7 @@ import os
 import logging
 import ipaddress
 import re
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Set
 
 import requests
 from proxmoxer import ProxmoxAPI
@@ -26,6 +26,67 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> Opt
     if required and not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+# ---------------------------------------------------------------------------
+# Sync mode selection
+# ---------------------------------------------------------------------------
+
+SYNC_MODE_ENV = "PVE_NB_SYNC_MODE"
+
+
+def parse_sync_mode(value: str) -> str:
+    """
+    Normalize a sync mode value (interactive input or env var).
+    Returns 'safe' or 'full'.
+    """
+    choice = (value or "").strip().lower()
+    if choice in ("1", "safe", "safe-update", "safe_update", "safeupdate"):
+        return "safe"
+    if choice in ("2", "full", "full-sync", "full_sync", "fullsync", "delete"):
+        return "full"
+    raise ValueError(f"Invalid sync mode: {value}")
+
+
+def select_sync_mode() -> str:
+    """
+    Ask the user which sync mode to run, unless pre-selected via env var.
+    """
+    env_choice = env(SYNC_MODE_ENV)
+    if env_choice:
+        try:
+            mode = parse_sync_mode(env_choice)
+        except ValueError:
+            raise SystemExit(
+                f"Invalid {SYNC_MODE_ENV} value '{env_choice}'. Use 1/2 or safe/full."
+            )
+        LOG.info("Sync mode preselected via %s=%s", SYNC_MODE_ENV, env_choice)
+        return mode
+
+    prompt = (
+        "Select sync mode:\n"
+        "1) Safe update (no deletions)\n"
+        "2) Full sync (delete missing VMs from NetBox)\n"
+        "Enter choice [1/2]: "
+    )
+
+    while True:
+        try:
+            choice = input(prompt).strip()
+        except EOFError:
+            raise SystemExit(
+                f"No interactive input available. Set {SYNC_MODE_ENV} to 1 or 2."
+            )
+
+        if not choice:
+            choice = "1"
+
+        try:
+            mode = parse_sync_mode(choice)
+            LOG.info("Sync mode selected: %s", mode)
+            return mode
+        except ValueError:
+            print("Please enter 1 or 2.")
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +373,39 @@ def fetch_guest_ips(
 
 
 # ---------------------------------------------------------------------------
+# NetBox VM matching helpers
+# ---------------------------------------------------------------------------
+
+def extract_vmid_from_comments(comments: Optional[str]) -> Optional[int]:
+    """
+    Try to pull `vmid=<int>` from a NetBox VM comments field.
+    """
+    if not comments:
+        return None
+    match = re.search(r"vmid=(\\d+)", comments)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def map_netbox_vms_by_vmid(nb, cluster) -> Dict[int, object]:
+    """
+    Build a map of vmid -> NetBox VM for the given cluster using vmid in comments.
+    """
+    mapping: Dict[int, object] = {}
+    cluster_vms = nb.virtualization.virtual_machines.filter(cluster_id=cluster.id)
+    for vm in cluster_vms:
+        vmid = extract_vmid_from_comments(getattr(vm, "comments", ""))
+        if vmid is None or vmid in mapping:
+            continue
+        mapping[vmid] = vm
+    return mapping
+
+
+# ---------------------------------------------------------------------------
 # Disk size helpers
 # ---------------------------------------------------------------------------
 
@@ -330,6 +424,16 @@ def parse_disk_sizes_from_config(config: dict) -> int:
         if not key_l.startswith(DISK_KEY_PREFIXES):
             continue
         if not isinstance(value, str):
+            continue
+        value_l = value.lower()
+        # Ignore ISO / CD-ROM attachments (they carry size=N but aren't disk storage)
+        if (
+            "media=cdrom" in value_l
+            or ",cdrom" in value_l
+            or "cdrom=" in value_l
+            or ".iso" in value_l
+            or "iso/" in value_l
+        ):
             continue
 
         match = size_re.search(value)
@@ -704,16 +808,21 @@ def sync_vms(
     cluster,
     node_devices: Dict[str, Optional[object]],
     site,
-):
+    vmid_map: Dict[int, object],
+) -> Tuple[Set[str], Set[int]]:
     """
     Sync all Proxmox VMs (QEMU + LXC) into NetBox virtualization.virtual_machines.
 
     We enumerate VMs per node:
       - /nodes/{node}/qemu
       - /nodes/{node}/lxc
+
+    Returns (names_seen, vmids_seen) so deletion logic can be vmid-aware.
     """
     nodes = proxmox.nodes.get()
     total_vms = 0
+    synced_vm_names: Set[str] = set()
+    synced_vm_ids: Set[int] = set()
 
     for node in nodes:
         node_name = node["node"]
@@ -740,7 +849,7 @@ def sync_vms(
 
         for vm in qemus:
             total_vms += 1
-            sync_single_vm(
+            name, vmid = sync_single_vm(
                 nb=nb,
                 proxmox=proxmox,
                 vm=vm,
@@ -749,11 +858,14 @@ def sync_vms(
                 cluster=cluster,
                 pve_type="qemu",
                 site=site,
+                vmid_map=vmid_map,
             )
+            synced_vm_names.add(name)
+            synced_vm_ids.add(vmid)
 
         for vm in lxcs:
             total_vms += 1
-            sync_single_vm(
+            name, vmid = sync_single_vm(
                 nb=nb,
                 proxmox=proxmox,
                 vm=vm,
@@ -762,9 +874,13 @@ def sync_vms(
                 cluster=cluster,
                 pve_type="lxc",
                 site=site,
+                vmid_map=vmid_map,
             )
+            synced_vm_names.add(name)
+            synced_vm_ids.add(vmid)
 
     LOG.info("Total Proxmox guests synced (QEMU + LXC): %d", total_vms)
+    return synced_vm_names, synced_vm_ids
 
 
 def sync_single_vm(
@@ -776,10 +892,14 @@ def sync_single_vm(
     cluster,
     pve_type: str,
     site,
-):
+    vmid_map: Dict[int, object],
+) -> Tuple[str, int]:
     """
     Create or update one NetBox Virtual Machine from a Proxmox VM/LXC dict
     and sync its interface + IPs.
+
+    Prefers matching an existing NetBox VM by vmid (from comments) to avoid
+    accidental deletion/duplication when names change.
     """
     vmid = vm["vmid"]
     name = vm.get("name") or f"vm-{vmid}"
@@ -813,6 +933,15 @@ def sync_single_vm(
     )
 
     nb_vm = nb.virtualization.virtual_machines.get(name=name, cluster_id=cluster.id)
+    if not nb_vm:
+        # Try to reuse an existing NetBox VM that matches vmid in comments
+        existing_by_vmid = vmid_map.pop(vmid, None)
+        if existing_by_vmid:
+            nb_vm = existing_by_vmid
+            if nb_vm.name != name:
+                LOG.info("Renaming NetBox VM %s -> %s based on vmid match", nb_vm.name, name)
+                nb_vm.name = name
+
     if not nb_vm:
         LOG.info("Creating NetBox VM %s", name)
         create_data = {
@@ -867,6 +996,49 @@ def sync_single_vm(
         nb_vm=nb_vm,
         site=site,
     )
+    return name, vmid
+
+
+# ---------------------------------------------------------------------------
+# Full sync pruning
+# ---------------------------------------------------------------------------
+
+def delete_missing_netbox_vms(nb, cluster, keep_names: Set[str], keep_vm_ids: Set[int]):
+    """
+    Remove NetBox VMs in the target cluster that are absent from Proxmox.
+    Keeps any VM whose name is seen OR whose vmid (parsed from comments) is seen.
+    """
+    cluster_label = getattr(cluster, "name", getattr(cluster, "id", cluster))
+    cluster_vms = list(nb.virtualization.virtual_machines.filter(cluster_id=cluster.id))
+    to_delete = []
+    for vm in cluster_vms:
+        if vm.name in keep_names:
+            continue
+        vmid = extract_vmid_from_comments(getattr(vm, "comments", ""))
+        if vmid is not None and vmid in keep_vm_ids:
+            # Matched by vmid; keep it (name likely changed and was reused above)
+            continue
+        to_delete.append(vm)
+
+    if not to_delete:
+        LOG.info("Full sync: no NetBox VMs to delete in cluster %s", cluster_label)
+        return
+
+    LOG.info(
+        "Full sync: deleting %d NetBox VMs not present in Proxmox",
+        len(to_delete),
+    )
+    for vm in to_delete:
+        LOG.info("Deleting NetBox VM %s (id=%s)", vm.name, vm.id)
+        try:
+            vm.delete()
+        except RequestError as exc:
+            LOG.error(
+                "Failed to delete NetBox VM %s (id=%s): %s",
+                vm.name,
+                vm.id,
+                exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +1051,9 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    sync_mode = select_sync_mode()
+    delete_missing = sync_mode == "full"
+
     proxmox = connect_proxmox()
     nb = connect_netbox()
 
@@ -887,10 +1062,15 @@ def main():
     role = get_nb_device_role(nb)
     dtype = get_nb_device_type(nb)
 
+    vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
-    sync_vms(nb, proxmox, cluster, node_devices, site)
+    synced_vm_names, synced_vm_ids = sync_vms(
+        nb, proxmox, cluster, node_devices, site, vmid_map
+    )
+
+    if delete_missing:
+        delete_missing_netbox_vms(nb, cluster, synced_vm_names, synced_vm_ids)
 
 
 if __name__ == "__main__":
     main()
-
