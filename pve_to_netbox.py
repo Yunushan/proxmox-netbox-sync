@@ -251,8 +251,8 @@ def parse_proxmox_tags(raw: Optional[object]) -> List[str]:
     return unique
 
 
-def ensure_netbox_tags(nb, tags: List[str]) -> Tuple[List[str], bool]:
-    ensured: List[str] = []
+def ensure_netbox_tags(nb, tags: List[str]) -> Tuple[List[int], bool]:
+    ensured: List[int] = []
     unresolved = False
 
     for tag in tags:
@@ -283,7 +283,7 @@ def ensure_netbox_tags(nb, tags: List[str]) -> Tuple[List[str], bool]:
                     continue
 
         if tag_obj:
-            ensured.append(tag_obj.name or tag_name)
+            ensured.append(tag_obj.id)
             continue
 
         create_payload = {"name": tag_name}
@@ -292,8 +292,9 @@ def ensure_netbox_tags(nb, tags: List[str]) -> Tuple[List[str], bool]:
             create_payload["slug"] = slug
 
         try:
-            nb.extras.tags.create(create_payload)
-            ensured.append(tag_name)
+            tag_obj = nb.extras.tags.create(create_payload)
+            if tag_obj:
+                ensured.append(tag_obj.id)
         except RequestError as exc:
             LOG.warning("Failed to create NetBox tag '%s': %s", tag_name, exc)
             unresolved = True
@@ -1127,18 +1128,18 @@ def sync_single_vm(
     tags_to_set: Optional[List[str]] = None
     if tags_known:
         if tags:
-            ensured_tags, unresolved = ensure_netbox_tags(nb, tags)
-            if unresolved and not ensured_tags:
+            ensured_tag_ids, unresolved = ensure_netbox_tags(nb, tags)
+            if unresolved and not ensured_tag_ids:
                 LOG.warning("Skipping tag sync for VM %s; unable to ensure tags", name)
             else:
-                if unresolved and len(ensured_tags) != len(tags):
+                if unresolved and len(ensured_tag_ids) != len(tags):
                     LOG.warning(
                         "VM %s: some tags could not be ensured; syncing %d of %d",
                         name,
-                        len(ensured_tags),
+                        len(ensured_tag_ids),
                         len(tags),
                     )
-                tags_to_set = ensured_tags
+                tags_to_set = ensured_tag_ids
         else:
             tags_to_set = []
 
