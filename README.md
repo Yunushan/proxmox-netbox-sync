@@ -31,7 +31,7 @@ pip install proxmoxer pynetbox requests
    - `NB_URL`, `NB_TOKEN`, `NB_VERIFY_SSL`
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
    - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
-   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; skipped if the custom field does not exist)
+   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; auto-created and auto-attached to VMs if missing, requires NetBox custom field write permissions)
    - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
 
 ### Sync modes

@@ -386,6 +386,144 @@ def resolve_vm_pool_tags(
     return pool, pool_known, tags, tags_known
 
 
+def create_vm_pool_custom_field(nb, pool_cf_key: str) -> Optional[object]:
+    base_payload = {
+        "name": pool_cf_key,
+        "label": "Pool",
+        "type": "text",
+        "description": "Proxmox pool name",
+    }
+
+    attempts = [
+        {**base_payload, "object_types": ["virtualization.virtualmachine"]},
+        {**base_payload, "content_types": ["virtualization.virtualmachine"]},
+        {"name": pool_cf_key, "type": "text", "object_types": ["virtualization.virtualmachine"]},
+        {"name": pool_cf_key, "type": "text", "content_types": ["virtualization.virtualmachine"]},
+    ]
+
+    last_exc: Optional[RequestError] = None
+    for payload in attempts:
+        try:
+            return nb.extras.custom_fields.create(payload)
+        except RequestError as exc:
+            last_exc = exc
+
+    if last_exc:
+        LOG.warning(
+            "Failed to auto-create NetBox custom field '%s': %s",
+            pool_cf_key,
+            last_exc,
+        )
+    return None
+
+
+def normalize_content_type_list(values: Optional[object]) -> Tuple[List[object], bool, bool]:
+    normalized: List[object] = []
+    has_int = False
+    has_str = False
+
+    if not values:
+        return normalized, has_int, has_str
+
+    for item in values:
+        if isinstance(item, str):
+            normalized.append(item)
+            has_str = True
+            continue
+        if isinstance(item, int):
+            normalized.append(item)
+            has_int = True
+            continue
+        if isinstance(item, dict):
+            if "app_label" in item and "model" in item:
+                normalized.append(f"{item['app_label']}.{item['model']}")
+                has_str = True
+                continue
+            if "display" in item:
+                normalized.append(str(item["display"]))
+                has_str = True
+                continue
+            if "name" in item:
+                normalized.append(str(item["name"]))
+                has_str = True
+                continue
+            if "id" in item:
+                try:
+                    normalized.append(int(item["id"]))
+                    has_int = True
+                except (TypeError, ValueError):
+                    pass
+
+    return normalized, has_int, has_str
+
+
+def get_vm_content_type_id(nb) -> Optional[int]:
+    try:
+        ct_endpoint = getattr(nb.extras, "content_types", None)
+        if not ct_endpoint:
+            return None
+        ct = ct_endpoint.get(app_label="virtualization", model="virtualmachine")
+    except Exception as exc:
+        LOG.warning("Failed to query NetBox content types: %s", exc)
+        return None
+    return getattr(ct, "id", None)
+
+
+def ensure_vm_pool_custom_field_attached(nb, cf, pool_cf_key: str) -> bool:
+    target_type = "virtualization.virtualmachine"
+
+    raw_object_types = getattr(cf, "object_types", None)
+    raw_content_types = getattr(cf, "content_types", None)
+    field_attr = "object_types" if raw_object_types is not None else "content_types"
+    raw_types = raw_object_types if raw_object_types is not None else raw_content_types
+
+    normalized, has_int, has_str = normalize_content_type_list(raw_types)
+
+    if has_str and target_type in normalized:
+        return True
+
+    if has_int:
+        ct_id = get_vm_content_type_id(nb)
+        if ct_id and ct_id in normalized:
+            return True
+
+    def try_save(updated_values: List[object]) -> bool:
+        try:
+            setattr(cf, field_attr, updated_values)
+            cf.save()
+            return True
+        except RequestError as exc:
+            LOG.warning(
+                "Failed to auto-attach NetBox custom field '%s': %s",
+                pool_cf_key,
+                exc,
+            )
+            return False
+
+    if has_str or not has_int:
+        updated = [item for item in normalized if isinstance(item, str)]
+        if target_type not in updated:
+            updated.append(target_type)
+        if try_save(updated):
+            return True
+
+    if has_int:
+        ct_id = get_vm_content_type_id(nb)
+        if not ct_id:
+            LOG.warning(
+                "Unable to resolve NetBox content type id for %s; pool sync disabled",
+                target_type,
+            )
+            return False
+        updated = [item for item in normalized if isinstance(item, int)]
+        if ct_id not in updated:
+            updated.append(ct_id)
+        if try_save(updated):
+            return True
+
+    return False
+
+
 def resolve_vm_pool_custom_field_key(nb) -> Optional[str]:
     pool_cf_key = (env("NB_VM_POOL_CF", "pool") or "").strip()
     if not pool_cf_key:
@@ -401,11 +539,16 @@ def resolve_vm_pool_custom_field_key(nb) -> Optional[str]:
         return None
 
     if not cf:
-        LOG.warning("NetBox custom field '%s' not found; pool sync disabled", pool_cf_key)
-        return None
+        LOG.warning(
+            "NetBox custom field '%s' not found; attempting to auto-create",
+            pool_cf_key,
+        )
+        cf = create_vm_pool_custom_field(nb, pool_cf_key)
+        if not cf:
+            LOG.warning("Pool sync disabled; custom field '%s' could not be created", pool_cf_key)
+            return None
 
-    content_types = getattr(cf, "content_types", None) or getattr(cf, "object_types", None) or []
-    if content_types and "virtualization.virtualmachine" not in content_types:
+    if not ensure_vm_pool_custom_field_attached(nb, cf, pool_cf_key):
         LOG.warning(
             "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
             "pool sync disabled",
