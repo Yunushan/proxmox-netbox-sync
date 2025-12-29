@@ -211,6 +211,211 @@ def map_node_status(pve_status: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Proxmox metadata helpers (pool + tags)
+# ---------------------------------------------------------------------------
+
+def slugify_tag(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    return value.strip("-")
+
+
+def parse_proxmox_tags(raw: Optional[object]) -> List[str]:
+    if raw is None:
+        return []
+
+    values: List[str] = []
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if item is None:
+                continue
+            values.append(str(item))
+    else:
+        values.append(str(raw))
+
+    tags: List[str] = []
+    for value in values:
+        for tag in re.split(r"[;,]", value):
+            tag = tag.strip()
+            if tag:
+                tags.append(tag)
+
+    seen: Set[str] = set()
+    unique: List[str] = []
+    for tag in tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        unique.append(tag)
+
+    return unique
+
+
+def ensure_netbox_tags(nb, tags: List[str]) -> Tuple[List[str], bool]:
+    ensured: List[str] = []
+    unresolved = False
+
+    for tag in tags:
+        tag_name = tag.strip()
+        if not tag_name:
+            continue
+
+        tag_obj = None
+        try:
+            tag_obj = nb.extras.tags.get(name=tag_name)
+        except RequestError as exc:
+            LOG.warning("Failed to query NetBox tags for '%s': %s", tag_name, exc)
+            unresolved = True
+            continue
+
+        if not tag_obj:
+            slug = slugify_tag(tag_name)
+            if slug:
+                try:
+                    tag_obj = nb.extras.tags.get(slug=slug)
+                except RequestError as exc:
+                    LOG.warning(
+                        "Failed to query NetBox tags by slug '%s': %s",
+                        slug,
+                        exc,
+                    )
+                    unresolved = True
+                    continue
+
+        if tag_obj:
+            ensured.append(tag_obj.name or tag_name)
+            continue
+
+        create_payload = {"name": tag_name}
+        slug = slugify_tag(tag_name)
+        if slug:
+            create_payload["slug"] = slug
+
+        try:
+            nb.extras.tags.create(create_payload)
+            ensured.append(tag_name)
+        except RequestError as exc:
+            LOG.warning("Failed to create NetBox tag '%s': %s", tag_name, exc)
+            unresolved = True
+
+    return ensured, unresolved
+
+
+def fetch_vm_config(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+) -> Optional[dict]:
+    try:
+        if pve_type == "qemu":
+            return proxmox.nodes(node_name).qemu(vmid).config.get()
+        if pve_type == "lxc":
+            return proxmox.nodes(node_name).lxc(vmid).config.get()
+    except Exception as exc:
+        LOG.debug("Failed to fetch config for vmid=%s (%s): %s", vmid, pve_type, exc)
+    return None
+
+
+def build_vm_resource_map(proxmox: ProxmoxAPI) -> Dict[int, dict]:
+    mapping: Dict[int, dict] = {}
+    try:
+        resources = proxmox.cluster.resources.get(type="vm")
+    except Exception as exc:
+        LOG.warning("Failed to fetch cluster resources for pool/tag sync: %s", exc)
+        return mapping
+
+    for res in resources:
+        vmid = res.get("vmid")
+        if not vmid:
+            rid = res.get("id") or ""
+            if "/" in rid:
+                try:
+                    vmid = int(rid.split("/", 1)[1])
+                except ValueError:
+                    vmid = None
+        try:
+            vmid_int = int(vmid)
+        except (TypeError, ValueError):
+            continue
+
+        mapping[vmid_int] = {
+            "pool": res.get("pool"),
+            "pool_known": "pool" in res,
+            "tags": res.get("tags"),
+            "tags_known": "tags" in res,
+        }
+
+    return mapping
+
+
+def resolve_vm_pool_tags(
+    vmid: int,
+    vm: dict,
+    vm_resource_map: Dict[int, dict],
+    config: Optional[dict],
+) -> Tuple[Optional[str], bool, List[str], bool]:
+    pool = None
+    pool_known = False
+    tags_raw: Optional[object] = None
+    tags_known = False
+
+    meta = vm_resource_map.get(vmid)
+    if meta:
+        if meta.get("pool_known"):
+            pool = meta.get("pool")
+            pool_known = True
+        if meta.get("tags_known"):
+            tags_raw = meta.get("tags")
+            tags_known = True
+
+    if not pool_known and "pool" in vm:
+        pool = vm.get("pool")
+        pool_known = True
+
+    if not tags_known and "tags" in vm:
+        tags_raw = vm.get("tags")
+        tags_known = True
+
+    if not tags_known and config is not None:
+        tags_raw = config.get("tags")
+        tags_known = True
+
+    tags = parse_proxmox_tags(tags_raw) if tags_known else []
+    return pool, pool_known, tags, tags_known
+
+
+def resolve_vm_pool_custom_field_key(nb) -> Optional[str]:
+    pool_cf_key = (env("NB_VM_POOL_CF", "pool") or "").strip()
+    if not pool_cf_key:
+        return None
+
+    try:
+        cf = nb.extras.custom_fields.get(name=pool_cf_key)
+    except Exception as exc:
+        LOG.warning(
+            "Unable to query NetBox custom fields; pool sync disabled: %s",
+            exc,
+        )
+        return None
+
+    if not cf:
+        LOG.warning("NetBox custom field '%s' not found; pool sync disabled", pool_cf_key)
+        return None
+
+    content_types = getattr(cf, "content_types", None) or getattr(cf, "object_types", None) or []
+    if content_types and "virtualization.virtualmachine" not in content_types:
+        LOG.warning(
+            "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
+            "pool sync disabled",
+            pool_cf_key,
+        )
+        return None
+
+    return pool_cf_key
+
+
+# ---------------------------------------------------------------------------
 # VLAN + interface helpers
 # ---------------------------------------------------------------------------
 
@@ -446,18 +651,19 @@ def parse_disk_sizes_from_config(config: dict) -> int:
     return int(total_mb)
 
 
-def get_vm_disk_mb(proxmox: ProxmoxAPI, node_name: str, vmid: int, pve_type: str, vm: dict) -> int:
+def get_vm_disk_mb(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+    vm: dict,
+    config: Optional[dict] = None,
+) -> int:
     """
     Determine VM disk size in MB (decimal). Prefer config parsing; fall back to maxdisk.
     """
-    config = {}
-    try:
-        if pve_type == "qemu":
-            config = proxmox.nodes(node_name).qemu(vmid).config.get()
-        elif pve_type == "lxc":
-            config = proxmox.nodes(node_name).lxc(vmid).config.get()
-    except Exception as exc:
-        LOG.debug("Failed to fetch config for disk sizing (vmid=%s): %s", vmid, exc)
+    if config is None:
+        config = fetch_vm_config(proxmox, node_name, vmid, pve_type)
 
     total_mb = parse_disk_sizes_from_config(config) if config else 0
     if total_mb > 0:
@@ -571,6 +777,7 @@ def ensure_vm_interface_and_ips(
     pve_type: str,
     nb_vm,
     site,
+    config: Optional[dict] = None,
 ):
     """
     Ensure VM has a vminterface with correct MAC/VLAN and assign IP addresses.
@@ -579,14 +786,10 @@ def ensure_vm_interface_and_ips(
     IPs come from qemu-guest-agent for QEMU guests.
     """
     # Get VM interface config (net0) from Proxmox
-    config = {}
-    try:
-        if pve_type == "qemu":
-            config = proxmox.nodes(node_name).qemu(vmid).config.get()
-        elif pve_type == "lxc":
-            config = proxmox.nodes(node_name).lxc(vmid).config.get()
-    except Exception as exc:
-        LOG.debug("Failed to get config for vmid=%s (%s): %s", vmid, pve_type, exc)
+    if config is None:
+        config = fetch_vm_config(proxmox, node_name, vmid, pve_type) or {}
+    else:
+        config = config or {}
 
     nic_info = parse_vm_nic_config(config.get("net0", ""))
     mac = nic_info["mac"]
@@ -809,6 +1012,8 @@ def sync_vms(
     node_devices: Dict[str, Optional[object]],
     site,
     vmid_map: Dict[int, object],
+    vm_resource_map: Dict[int, dict],
+    pool_cf_key: Optional[str],
 ) -> Tuple[Set[str], Set[int]]:
     """
     Sync all Proxmox VMs (QEMU + LXC) into NetBox virtualization.virtual_machines.
@@ -859,6 +1064,8 @@ def sync_vms(
                 pve_type="qemu",
                 site=site,
                 vmid_map=vmid_map,
+                vm_resource_map=vm_resource_map,
+                pool_cf_key=pool_cf_key,
             )
             synced_vm_names.add(name)
             synced_vm_ids.add(vmid)
@@ -875,6 +1082,8 @@ def sync_vms(
                 pve_type="lxc",
                 site=site,
                 vmid_map=vmid_map,
+                vm_resource_map=vm_resource_map,
+                pool_cf_key=pool_cf_key,
             )
             synced_vm_names.add(name)
             synced_vm_ids.add(vmid)
@@ -893,6 +1102,8 @@ def sync_single_vm(
     pve_type: str,
     site,
     vmid_map: Dict[int, object],
+    vm_resource_map: Dict[int, dict],
+    pool_cf_key: Optional[str],
 ) -> Tuple[str, int]:
     """
     Create or update one NetBox Virtual Machine from a Proxmox VM/LXC dict
@@ -905,6 +1116,37 @@ def sync_single_vm(
     name = vm.get("name") or f"vm-{vmid}"
     pve_status = vm.get("status", "stopped")
 
+    config = fetch_vm_config(proxmox, node_name, vmid, pve_type)
+    pool, pool_known, tags, tags_known = resolve_vm_pool_tags(
+        vmid,
+        vm,
+        vm_resource_map,
+        config,
+    )
+
+    tags_to_set: Optional[List[str]] = None
+    if tags_known:
+        if tags:
+            ensured_tags, unresolved = ensure_netbox_tags(nb, tags)
+            if unresolved and not ensured_tags:
+                LOG.warning("Skipping tag sync for VM %s; unable to ensure tags", name)
+            else:
+                if unresolved and len(ensured_tags) != len(tags):
+                    LOG.warning(
+                        "VM %s: some tags could not be ensured; syncing %d of %d",
+                        name,
+                        len(ensured_tags),
+                        len(tags),
+                    )
+                tags_to_set = ensured_tags
+        else:
+            tags_to_set = []
+
+    custom_fields_data = None
+    if pool_cf_key and pool_known:
+        pool_value = pool if pool not in ("", None) else None
+        custom_fields_data = {pool_cf_key: pool_value}
+
     # Different Proxmox endpoints expose CPU fields slightly differently
     vcpus = (
         vm.get("cores")
@@ -913,7 +1155,7 @@ def sync_single_vm(
         or 1
     )
     memory_mb = bytes_to_mb(vm.get("maxmem", 0))
-    disk_mb = get_vm_disk_mb(proxmox, node_name, vmid, pve_type, vm)  # decimal MB
+    disk_mb = get_vm_disk_mb(proxmox, node_name, vmid, pve_type, vm, config=config)  # decimal MB
 
     status_slug = map_vm_status(pve_status)
 
@@ -958,6 +1200,10 @@ def sync_single_vm(
             create_data["site"] = site.id
         if host_device:
             create_data["device"] = host_device.id
+        if tags_to_set is not None:
+            create_data["tags"] = tags_to_set
+        if custom_fields_data:
+            create_data["custom_fields"] = custom_fields_data
 
         nb_vm = nb.virtualization.virtual_machines.create(create_data)
     else:
@@ -971,6 +1217,12 @@ def sync_single_vm(
             nb_vm.site = site
         if host_device:
             nb_vm.device = host_device
+        if tags_to_set is not None:
+            nb_vm.tags = tags_to_set
+        if custom_fields_data:
+            merged_fields = dict(getattr(nb_vm, "custom_fields", {}) or {})
+            merged_fields.update(custom_fields_data)
+            nb_vm.custom_fields = merged_fields
 
         # Align disk with existing virtual disks if present; otherwise use computed.
         try:
@@ -995,6 +1247,7 @@ def sync_single_vm(
         pve_type=pve_type,
         nb_vm=nb_vm,
         site=site,
+        config=config,
     )
     return name, vmid
 
@@ -1061,11 +1314,13 @@ def main():
     site = get_nb_site(nb)
     role = get_nb_device_role(nb)
     dtype = get_nb_device_type(nb)
+    pool_cf_key = resolve_vm_pool_custom_field_key(nb)
+    vm_resource_map = build_vm_resource_map(proxmox)
 
     vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
     synced_vm_names, synced_vm_ids = sync_vms(
-        nb, proxmox, cluster, node_devices, site, vmid_map
+        nb, proxmox, cluster, node_devices, site, vmid_map, vm_resource_map, pool_cf_key
     )
 
     if delete_missing:

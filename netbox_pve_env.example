@@ -21,4 +21,5 @@ export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slu
 export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices)
 export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
 export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
+export NB_VM_POOL_CF="pool"                  # Optional VM custom field key for Proxmox pool
 

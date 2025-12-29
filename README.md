@@ -1,6 +1,6 @@
 # Proxmox to NetBox Sync
 
-Sync Proxmox VE nodes, VMs, interfaces, VLANs, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, and VLANs are auto-created (optionally scoped to a site).
+Sync Proxmox VE nodes, VMs, interfaces, VLANs, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, and VLANs are auto-created (optionally scoped to a site). Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field.
 
 ## Requirements
 
@@ -31,6 +31,7 @@ pip install proxmoxer pynetbox requests
    - `NB_URL`, `NB_TOKEN`, `NB_VERIFY_SSL`
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
    - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
+   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; skipped if the custom field does not exist)
    - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
 
 ### Sync modes
