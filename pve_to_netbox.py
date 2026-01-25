@@ -1336,24 +1336,35 @@ def fetch_guest_default_gateways(
         )
         return parse_gateway_list_lines(out4 or ""), parse_gateway_list_lines(out6 or "")
 
-    gw4_cmd = "ip -4 route show default 2>/dev/null || /sbin/ip -4 route show default 2>/dev/null"
-    gw6_cmd = "ip -6 route show default 2>/dev/null || /sbin/ip -6 route show default 2>/dev/null"
-    out4 = run_guest_agent_command(
-        proxmox,
-        node_name,
-        vmid,
-        pve_type,
-        command="/bin/sh",
-        args=["-c", gw4_cmd],
-    )
-    out6 = run_guest_agent_command(
-        proxmox,
-        node_name,
-        vmid,
-        pve_type,
-        command="/bin/sh",
-        args=["-c", gw6_cmd],
-    )
+    def run_guest_cmd_variants(cmds: List[str]) -> str:
+        for cmd in cmds:
+            out = run_guest_agent_command(
+                proxmox,
+                node_name,
+                vmid,
+                pve_type,
+                command="/bin/sh",
+                args=["-c", cmd],
+            )
+            if out:
+                return out
+        return ""
+
+    gw4_cmds = [
+        "ip -4 route show default",
+        "/usr/sbin/ip -4 route show default",
+        "/sbin/ip -4 route show default",
+        "ip route show default",
+        "/usr/sbin/ip route show default",
+        "/sbin/ip route show default",
+    ]
+    gw6_cmds = [
+        "ip -6 route show default",
+        "/usr/sbin/ip -6 route show default",
+        "/sbin/ip -6 route show default",
+    ]
+    out4 = run_guest_cmd_variants(gw4_cmds)
+    out6 = run_guest_cmd_variants(gw6_cmds)
     return parse_default_gateway_lines(out4 or ""), parse_default_gateway_lines(out6 or "")
 
 
