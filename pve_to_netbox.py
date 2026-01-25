@@ -1282,7 +1282,13 @@ def parse_default_gateway_lines(output: str) -> List[str]:
         line = line.strip()
         if not line:
             continue
-        match = re.search(r"\\bvia\\s+(\\S+)", line)
+        tokens = line.split()
+        if "via" in tokens:
+            idx = tokens.index("via")
+            if idx + 1 < len(tokens):
+                gateways.append(tokens[idx + 1])
+                continue
+        match = re.search(r"\bvia\s+(\S+)", line)
         if match:
             gateways.append(match.group(1))
     return gateways
