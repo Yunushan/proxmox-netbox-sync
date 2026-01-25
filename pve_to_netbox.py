@@ -833,6 +833,44 @@ def decode_guest_agent_output(raw: Optional[object]) -> str:
     return text
 
 
+def build_guest_exec_stdin_payload(
+    command: str,
+    args: Optional[List[str]],
+) -> Optional[dict]:
+    if not command:
+        return None
+
+    args = args or []
+    script = None
+
+    if command.lower().endswith("powershell.exe"):
+        try:
+            cmd_index = args.index("-Command")
+            script = " ".join(args[cmd_index + 1 :]).strip()
+        except ValueError:
+            script = " ".join(args).strip() if args else None
+    elif command.endswith("/sh") or command.endswith("\\sh"):
+        if "-c" in args:
+            try:
+                c_index = args.index("-c")
+                script = " ".join(args[c_index + 1 :]).strip()
+            except ValueError:
+                script = " ".join(args).strip() if args else None
+        else:
+            script = " ".join(args).strip() if args else None
+    else:
+        script = " ".join(args).strip() if args else None
+
+    if not script:
+        return None
+
+    if not script.endswith("\n"):
+        script += "\n"
+
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return {"command": command, "input-data": encoded}
+
+
 def run_guest_agent_command(
     proxmox: ProxmoxAPI,
     node_name: str,
@@ -871,6 +909,25 @@ def run_guest_agent_command(
                 exc,
             )
             result = None
+
+    if result is None:
+        stdin_payload = build_guest_exec_stdin_payload(command, arg_list)
+        if stdin_payload:
+            try:
+                result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
+                LOG.debug(
+                    "Guest exec succeeded using stdin payload for vmid=%s on %s",
+                    vmid,
+                    node_name,
+                )
+            except Exception as exc:
+                LOG.debug(
+                    "Guest exec failed with stdin payload for vmid=%s on %s: %s",
+                    vmid,
+                    node_name,
+                    exc,
+                )
+                result = None
 
     if result is None:
         if last_exc:
