@@ -3,6 +3,9 @@ import os
 import logging
 import ipaddress
 import re
+import base64
+import binascii
+import time
 from typing import Dict, Optional, List, Tuple, Set
 
 import requests
@@ -33,6 +36,7 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> Opt
 # ---------------------------------------------------------------------------
 
 SYNC_MODE_ENV = "PVE_NB_SYNC_MODE"
+GUEST_GW_FALLBACK_ENV = "PVE_GUEST_GW_FALLBACK"
 
 
 def parse_sync_mode(value: str) -> str:
@@ -736,18 +740,6 @@ def parse_gateway_settings(raw_value: str) -> Tuple[Optional[str], bool, Optiona
     return gw4, gw4_known, gw6, gw6_known
 
 
-def normalize_gateway_value(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    try:
-        return str(ipaddress.ip_address(value))
-    except ValueError:
-        return None
-
-
 def iter_vm_gateway_configs(pve_type: str, config: dict) -> List[str]:
     if pve_type == "lxc":
         pattern = r"^net(\d+)$"
@@ -792,6 +784,202 @@ def resolve_vm_gateways(
                 gw6_values.append(gw6)
 
     return gw4_values, gw4_known, gw6_values, gw6_known
+
+
+def decode_guest_agent_output(raw: Optional[object]) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    if re.fullmatch(r"[A-Za-z0-9+/=]+", text) and len(text) % 4 == 0:
+        try:
+            decoded = base64.b64decode(text, validate=True)
+            return decoded.decode("utf-8", errors="replace")
+        except (binascii.Error, ValueError):
+            pass
+
+    return text
+
+
+def run_guest_agent_command(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+    command: str,
+    args: Optional[List[str]] = None,
+    timeout_s: int = 8,
+) -> Optional[str]:
+    if pve_type != "qemu":
+        return None
+
+    try:
+        result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(
+            command=command,
+            args=args or [],
+        )
+    except Exception as exc:
+        LOG.debug("Guest exec failed to start for vmid=%s on %s: %s", vmid, node_name, exc)
+        return None
+
+    if isinstance(result, dict) and isinstance(result.get("result"), dict):
+        result = result["result"]
+
+    pid = result.get("pid") if isinstance(result, dict) else None
+    if not pid:
+        return None
+
+    status = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            status = proxmox.nodes(node_name).qemu(vmid).agent("exec-status").get(pid=pid)
+        except Exception as exc:
+            LOG.debug("Guest exec status failed for vmid=%s on %s: %s", vmid, node_name, exc)
+            return None
+        if isinstance(status, dict) and isinstance(status.get("result"), dict):
+            status = status["result"]
+        if not isinstance(status, dict):
+            return None
+        if status.get("exited"):
+            break
+        time.sleep(0.2)
+
+    if not status or not status.get("exited"):
+        LOG.warning("Guest exec timed out for vmid=%s on %s", vmid, node_name)
+        return None
+
+    exitcode = status.get("exitcode")
+    if exitcode not in (0, None):
+        err_data = decode_guest_agent_output(status.get("err-data"))
+        if err_data:
+            LOG.debug(
+                "Guest exec exitcode=%s for vmid=%s on %s: %s",
+                exitcode,
+                vmid,
+                node_name,
+                err_data,
+            )
+        return None
+
+    return decode_guest_agent_output(status.get("out-data"))
+
+
+def fetch_guest_osinfo(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+) -> Optional[dict]:
+    if pve_type != "qemu":
+        return None
+
+    try:
+        result = proxmox.nodes(node_name).qemu(vmid).agent("get-osinfo").get()
+    except Exception:
+        return None
+
+    if isinstance(result, dict) and "result" in result:
+        return result.get("result")
+    if isinstance(result, dict):
+        return result
+    return None
+
+
+def is_guest_windows(osinfo: Optional[dict]) -> bool:
+    if not osinfo:
+        return False
+    for key in ("name", "id", "pretty-name", "version"):
+        value = osinfo.get(key)
+        if isinstance(value, str) and "windows" in value.lower():
+            return True
+    return False
+
+
+def parse_default_gateway_lines(output: str) -> List[str]:
+    gateways: List[str] = []
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.search(r"\\bvia\\s+(\\S+)", line)
+        if match:
+            gateways.append(match.group(1))
+    return gateways
+
+
+def parse_gateway_list_lines(output: str) -> List[str]:
+    gateways: List[str] = []
+    for line in (output or "").splitlines():
+        value = line.strip()
+        if value:
+            gateways.append(value)
+    return gateways
+
+
+def fetch_guest_default_gateways(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+) -> Tuple[List[str], List[str]]:
+    if pve_type != "qemu":
+        return [], []
+
+    osinfo = fetch_guest_osinfo(proxmox, node_name, vmid, pve_type)
+    if is_guest_windows(osinfo):
+        gw4_cmd = (
+            "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | "
+            "Where-Object {$_.NextHop -ne '0.0.0.0'} | "
+            "Select-Object -ExpandProperty NextHop"
+        )
+        gw6_cmd = (
+            "Get-NetRoute -DestinationPrefix ::/0 | "
+            "Where-Object {$_.NextHop -ne '::'} | "
+            "Select-Object -ExpandProperty NextHop"
+        )
+        out4 = run_guest_agent_command(
+            proxmox,
+            node_name,
+            vmid,
+            pve_type,
+            command="powershell.exe",
+            args=["-NoProfile", "-Command", gw4_cmd],
+        )
+        out6 = run_guest_agent_command(
+            proxmox,
+            node_name,
+            vmid,
+            pve_type,
+            command="powershell.exe",
+            args=["-NoProfile", "-Command", gw6_cmd],
+        )
+        return parse_gateway_list_lines(out4 or ""), parse_gateway_list_lines(out6 or "")
+
+    gw4_cmd = "ip -4 route show default 2>/dev/null || /sbin/ip -4 route show default 2>/dev/null"
+    gw6_cmd = "ip -6 route show default 2>/dev/null || /sbin/ip -6 route show default 2>/dev/null"
+    out4 = run_guest_agent_command(
+        proxmox,
+        node_name,
+        vmid,
+        pve_type,
+        command="/bin/sh",
+        args=["-c", gw4_cmd],
+    )
+    out6 = run_guest_agent_command(
+        proxmox,
+        node_name,
+        vmid,
+        pve_type,
+        command="/bin/sh",
+        args=["-c", gw6_cmd],
+    )
+    return parse_default_gateway_lines(out4 or ""), parse_default_gateway_lines(out6 or "")
 
 
 def fetch_guest_agent_interfaces(
@@ -1462,6 +1650,29 @@ def sync_single_vm(
             tags_to_set = []
 
     gw4_values, gw4_known, gw6_values, gw6_known = resolve_vm_gateways(pve_type, config)
+    if (
+        pve_type == "qemu"
+        and env(GUEST_GW_FALLBACK_ENV, "true").lower() in ("1", "true", "yes")
+    ):
+        guest_gw4, guest_gw6 = fetch_guest_default_gateways(
+            proxmox,
+            node_name,
+            vmid,
+            pve_type,
+        )
+        if guest_gw4:
+            gw4_values.extend(guest_gw4)
+            gw4_known = True
+        if guest_gw6:
+            gw6_values.extend(guest_gw6)
+            gw6_known = True
+        if guest_gw4 or guest_gw6:
+            LOG.debug(
+                "VM %s: guest default gateways detected (v4=%s, v6=%s)",
+                name,
+                guest_gw4,
+                guest_gw6,
+            )
 
     def normalize_gateway_list(values: List[str], family: int, family_label: str) -> List[str]:
         normalized = []
