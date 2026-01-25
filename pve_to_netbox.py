@@ -954,9 +954,10 @@ def decode_guest_agent_output(raw: Optional[object]) -> str:
 def build_guest_exec_stdin_payload(
     command: str,
     args: Optional[List[str]],
-) -> Optional[dict]:
+    encode_base64: bool = True,
+) -> Tuple[Optional[dict], Optional[str]]:
     if not command:
-        return None
+        return None, None
 
     args = args or []
     script = None
@@ -980,13 +981,74 @@ def build_guest_exec_stdin_payload(
         script = " ".join(args).strip() if args else None
 
     if not script:
-        return None
+        return None, None
 
     if not script.endswith("\n"):
         script += "\n"
 
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    return {"command": command, "input-data": encoded}
+    payload_value = script
+    if encode_base64:
+        payload_value = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return {"command": command, "input-data": payload_value}, script
+
+
+def looks_like_base64_script_error(err_text: str, script: str) -> bool:
+    if not err_text or not script:
+        return False
+    match = re.search(r":\\s*([A-Za-z0-9+/=]{16,})\\s*:\\s*not found", err_text)
+    if not match:
+        return False
+    token = match.group(1)
+    try:
+        decoded = base64.b64decode(token, validate=True).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError):
+        return False
+    return script.strip() in decoded
+
+
+def collect_guest_exec_output(
+    node_proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    result: object,
+    timeout_s: int,
+) -> Tuple[Optional[str], Optional[int], str]:
+    if isinstance(result, dict) and isinstance(result.get("result"), dict):
+        result = result["result"]
+    elif isinstance(result, dict) and isinstance(result.get("data"), dict):
+        result = result["data"]
+
+    pid = result.get("pid") if isinstance(result, dict) else None
+    if not pid:
+        LOG.debug("Guest exec returned no pid for vmid=%s on %s: %s", vmid, node_name, result)
+        return None, None, ""
+
+    status = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            status = node_proxmox.nodes(node_name).qemu(vmid).agent("exec-status").get(pid=pid)
+        except Exception as exc:
+            LOG.debug("Guest exec status failed for vmid=%s on %s: %s", vmid, node_name, exc)
+            return None, None, ""
+        if isinstance(status, dict) and isinstance(status.get("result"), dict):
+            status = status["result"]
+        elif isinstance(status, dict) and isinstance(status.get("data"), dict):
+            status = status["data"]
+        if not isinstance(status, dict):
+            return None, None, ""
+        if status.get("exited"):
+            break
+        time.sleep(0.2)
+
+    if not status or not status.get("exited"):
+        LOG.warning("Guest exec timed out for vmid=%s on %s", vmid, node_name)
+        return None, None, ""
+
+    exitcode = status.get("exitcode")
+    out_data = decode_guest_agent_output(status.get("out-data"))
+    err_data = decode_guest_agent_output(status.get("err-data"))
+    return out_data, exitcode, err_data
 
 
 def run_guest_agent_command(
@@ -1015,6 +1077,8 @@ def run_guest_agent_command(
 
     result = None
     last_exc: Optional[Exception] = None
+    stdin_script = None
+    stdin_base64 = False
     for payload in payloads:
         try:
             result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
@@ -1031,7 +1095,11 @@ def run_guest_agent_command(
             result = None
 
     if result is None:
-        stdin_payload = build_guest_exec_stdin_payload(command, arg_list)
+        stdin_payload, stdin_script = build_guest_exec_stdin_payload(
+            command,
+            arg_list,
+            encode_base64=True,
+        )
         if stdin_payload:
             LOG.debug(
                 "Guest exec attempting stdin payload (keys=%s) for vmid=%s on %s",
@@ -1041,6 +1109,7 @@ def run_guest_agent_command(
             )
             try:
                 result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
+                stdin_base64 = True
                 LOG.debug(
                     "Guest exec succeeded using stdin payload for vmid=%s on %s",
                     vmid,
@@ -1054,6 +1123,8 @@ def run_guest_agent_command(
                     exc,
                 )
                 result = None
+                stdin_script = None
+                stdin_base64 = False
 
     if result is None and arg_list:
         combined_command = " ".join([command] + arg_list)
@@ -1081,41 +1152,50 @@ def run_guest_agent_command(
             LOG.debug("Guest exec failed to start for vmid=%s on %s: %s", vmid, node_name, last_exc)
         return None
 
-    if isinstance(result, dict) and isinstance(result.get("result"), dict):
-        result = result["result"]
-    elif isinstance(result, dict) and isinstance(result.get("data"), dict):
-        result = result["data"]
+    out_data, exitcode, err_data = collect_guest_exec_output(
+        node_proxmox,
+        node_name,
+        vmid,
+        result,
+        timeout_s,
+    )
 
-    pid = result.get("pid") if isinstance(result, dict) else None
-    if not pid:
-        LOG.debug("Guest exec returned no pid for vmid=%s on %s: %s", vmid, node_name, result)
-        return None
-
-    status = None
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            status = node_proxmox.nodes(node_name).qemu(vmid).agent("exec-status").get(pid=pid)
-        except Exception as exc:
-            LOG.debug("Guest exec status failed for vmid=%s on %s: %s", vmid, node_name, exc)
-            return None
-        if isinstance(status, dict) and isinstance(status.get("result"), dict):
-            status = status["result"]
-        elif isinstance(status, dict) and isinstance(status.get("data"), dict):
-            status = status["data"]
-        if not isinstance(status, dict):
-            return None
-        if status.get("exited"):
-            break
-        time.sleep(0.2)
-
-    if not status or not status.get("exited"):
-        LOG.warning("Guest exec timed out for vmid=%s on %s", vmid, node_name)
-        return None
-
-    exitcode = status.get("exitcode")
     if exitcode not in (0, None):
-        err_data = decode_guest_agent_output(status.get("err-data"))
+        if stdin_base64 and stdin_script and looks_like_base64_script_error(err_data, stdin_script):
+            raw_payload, _ = build_guest_exec_stdin_payload(
+                command,
+                arg_list,
+                encode_base64=False,
+            )
+            if raw_payload:
+                LOG.debug(
+                    "Guest exec retrying stdin payload without base64 for vmid=%s on %s",
+                    vmid,
+                    node_name,
+                )
+                try:
+                    result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(
+                        **raw_payload
+                    )
+                except Exception as exc:
+                    LOG.debug(
+                        "Guest exec failed with raw stdin payload for vmid=%s on %s: %s",
+                        vmid,
+                        node_name,
+                        exc,
+                    )
+                    return None
+
+                out_data, exitcode, err_data = collect_guest_exec_output(
+                    node_proxmox,
+                    node_name,
+                    vmid,
+                    result,
+                    timeout_s,
+                )
+                if exitcode in (0, None):
+                    return out_data
+
         if err_data:
             LOG.debug(
                 "Guest exec exitcode=%s for vmid=%s on %s: %s",
@@ -1126,7 +1206,7 @@ def run_guest_agent_command(
             )
         return None
 
-    return decode_guest_agent_output(status.get("out-data"))
+    return out_data
 
 
 def fetch_guest_osinfo(
