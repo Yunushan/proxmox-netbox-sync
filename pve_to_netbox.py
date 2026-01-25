@@ -846,10 +846,12 @@ def run_guest_agent_command(
         return None
 
     try:
-        result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(
-            command=command,
-            args=args or [],
-        )
+        payload = {
+            "command": command,
+            "arg": args or [],
+            "capture-output": 1,
+        }
+        result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
     except Exception as exc:
         LOG.debug("Guest exec failed to start for vmid=%s on %s: %s", vmid, node_name, exc)
         return None
