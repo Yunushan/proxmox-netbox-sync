@@ -856,9 +856,12 @@ def run_guest_agent_command(
 
     if isinstance(result, dict) and isinstance(result.get("result"), dict):
         result = result["result"]
+    elif isinstance(result, dict) and isinstance(result.get("data"), dict):
+        result = result["data"]
 
     pid = result.get("pid") if isinstance(result, dict) else None
     if not pid:
+        LOG.debug("Guest exec returned no pid for vmid=%s on %s: %s", vmid, node_name, result)
         return None
 
     status = None
@@ -871,6 +874,8 @@ def run_guest_agent_command(
             return None
         if isinstance(status, dict) and isinstance(status.get("result"), dict):
             status = status["result"]
+        elif isinstance(status, dict) and isinstance(status.get("data"), dict):
+            status = status["data"]
         if not isinstance(status, dict):
             return None
         if status.get("exited"):
@@ -913,6 +918,8 @@ def fetch_guest_osinfo(
 
     if isinstance(result, dict) and "result" in result:
         return result.get("result")
+    if isinstance(result, dict) and "data" in result:
+        return result.get("data")
     if isinstance(result, dict):
         return result
     return None
