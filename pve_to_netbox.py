@@ -845,15 +845,36 @@ def run_guest_agent_command(
     if pve_type != "qemu":
         return None
 
-    try:
-        payload = {
-            "command": command,
-            "arg": args or [],
-            "capture-output": 1,
-        }
-        result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
-    except Exception as exc:
-        LOG.debug("Guest exec failed to start for vmid=%s on %s: %s", vmid, node_name, exc)
+    arg_list = args or []
+    payloads = [
+        {"command": command, "arg": arg_list, "capture-output": 1},
+        {"command": command, "args": arg_list, "capture-output": 1},
+        {"command": command, "arg": arg_list},
+        {"command": command, "args": arg_list},
+    ]
+    if not arg_list:
+        payloads.append({"command": command})
+
+    result = None
+    last_exc: Optional[Exception] = None
+    for payload in payloads:
+        try:
+            result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
+            break
+        except Exception as exc:
+            last_exc = exc
+            LOG.debug(
+                "Guest exec failed (payload keys=%s) for vmid=%s on %s: %s",
+                ",".join(payload.keys()),
+                vmid,
+                node_name,
+                exc,
+            )
+            result = None
+
+    if result is None:
+        if last_exc:
+            LOG.debug("Guest exec failed to start for vmid=%s on %s: %s", vmid, node_name, last_exc)
         return None
 
     if isinstance(result, dict) and isinstance(result.get("result"), dict):
