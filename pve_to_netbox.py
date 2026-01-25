@@ -954,7 +954,7 @@ def decode_guest_agent_output(raw: Optional[object]) -> str:
 def build_guest_exec_stdin_payload(
     command: str,
     args: Optional[List[str]],
-    encode_base64: bool = True,
+    encode_base64: bool = False,
 ) -> Tuple[Optional[dict], Optional[str]]:
     if not command:
         return None, None
@@ -1098,11 +1098,43 @@ def run_guest_agent_command(
         stdin_payload, stdin_script = build_guest_exec_stdin_payload(
             command,
             arg_list,
+            encode_base64=False,
+        )
+        if stdin_payload:
+            LOG.debug(
+                "Guest exec attempting stdin payload (mode=raw, keys=%s) for vmid=%s on %s",
+                ",".join(stdin_payload.keys()),
+                vmid,
+                node_name,
+            )
+            try:
+                result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
+                stdin_base64 = False
+                LOG.debug(
+                    "Guest exec succeeded using stdin payload for vmid=%s on %s",
+                    vmid,
+                    node_name,
+                )
+            except Exception as exc:
+                LOG.debug(
+                    "Guest exec failed with stdin payload for vmid=%s on %s: %s",
+                    vmid,
+                    node_name,
+                    exc,
+                )
+                result = None
+                stdin_script = None
+                stdin_base64 = False
+
+    if result is None:
+        stdin_payload, stdin_script = build_guest_exec_stdin_payload(
+            command,
+            arg_list,
             encode_base64=True,
         )
         if stdin_payload:
             LOG.debug(
-                "Guest exec attempting stdin payload (keys=%s) for vmid=%s on %s",
+                "Guest exec attempting stdin payload (mode=base64, keys=%s) for vmid=%s on %s",
                 ",".join(stdin_payload.keys()),
                 vmid,
                 node_name,
