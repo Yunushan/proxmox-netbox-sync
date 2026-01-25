@@ -22,4 +22,6 @@ export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLAN
 export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
 export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
 export NB_VM_POOL_CF="pool"                  # Optional VM custom field key for Proxmox pool
+export NB_VM_GW4_CF="gateway4"               # Optional VM custom field key for IPv4 gateway (set empty to disable)
+export NB_VM_GW6_CF="gateway6"               # Optional VM custom field key for IPv6 gateway (set empty to disable)
 

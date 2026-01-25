@@ -386,12 +386,17 @@ def resolve_vm_pool_tags(
     return pool, pool_known, tags, tags_known
 
 
-def create_vm_pool_custom_field(nb, pool_cf_key: str) -> Optional[object]:
+def create_vm_text_custom_field(
+    nb,
+    field_key: str,
+    label: str,
+    description: str,
+) -> Optional[object]:
     base_payload = {
-        "name": pool_cf_key,
-        "label": "Pool",
+        "name": field_key,
+        "label": label,
         "type": "text",
-        "description": "Proxmox pool name",
+        "description": description,
     }
 
     attempts = [
@@ -411,10 +416,19 @@ def create_vm_pool_custom_field(nb, pool_cf_key: str) -> Optional[object]:
     if last_exc:
         LOG.warning(
             "Failed to auto-create NetBox custom field '%s': %s",
-            pool_cf_key,
+            field_key,
             last_exc,
         )
     return None
+
+
+def create_vm_pool_custom_field(nb, pool_cf_key: str) -> Optional[object]:
+    return create_vm_text_custom_field(
+        nb,
+        pool_cf_key,
+        "Pool",
+        "Proxmox pool name",
+    )
 
 
 def normalize_content_type_list(values: Optional[object]) -> Tuple[List[object], bool, bool]:
@@ -559,6 +573,71 @@ def resolve_vm_pool_custom_field_key(nb) -> Optional[str]:
     return pool_cf_key
 
 
+def resolve_vm_gateway_custom_field_key(
+    nb,
+    env_var: str,
+    label: str,
+    description: str,
+    default_key: Optional[str] = None,
+) -> Optional[str]:
+    field_key = (env(env_var, default_key) or "").strip()
+    if not field_key:
+        return None
+
+    try:
+        cf = nb.extras.custom_fields.get(name=field_key)
+    except Exception as exc:
+        LOG.warning(
+            "Unable to query NetBox custom fields; %s sync disabled: %s",
+            label,
+            exc,
+        )
+        return None
+
+    if not cf:
+        LOG.warning(
+            "NetBox custom field '%s' not found; attempting to auto-create",
+            field_key,
+        )
+        cf = create_vm_text_custom_field(nb, field_key, label, description)
+        if not cf:
+            LOG.warning(
+                "%s sync disabled; custom field '%s' could not be created",
+                label,
+                field_key,
+            )
+            return None
+
+    if not ensure_vm_pool_custom_field_attached(nb, cf, field_key):
+        LOG.warning(
+            "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
+            "%s sync disabled",
+            field_key,
+            label,
+        )
+        return None
+
+    return field_key
+
+
+def resolve_vm_gateway_custom_field_keys(nb) -> Tuple[Optional[str], Optional[str]]:
+    gw4_key = resolve_vm_gateway_custom_field_key(
+        nb,
+        "NB_VM_GW4_CF",
+        "Gateway IPv4",
+        "Proxmox VM default IPv4 gateway",
+        default_key="gateway4",
+    )
+    gw6_key = resolve_vm_gateway_custom_field_key(
+        nb,
+        "NB_VM_GW6_CF",
+        "Gateway IPv6",
+        "Proxmox VM default IPv6 gateway",
+        default_key="gateway6",
+    )
+    return gw4_key, gw6_key
+
+
 # ---------------------------------------------------------------------------
 # VLAN + interface helpers
 # ---------------------------------------------------------------------------
@@ -625,6 +704,94 @@ def parse_vm_nic_config(net_value: str) -> Dict[str, Optional[object]]:
                 pass
 
     return {"name": "net0", "mac": mac, "bridge": bridge, "vlan": vlan}
+
+
+def parse_gateway_settings(raw_value: str) -> Tuple[Optional[str], bool, Optional[str], bool]:
+    """
+    Parse gw/gw6 from a Proxmox config string (netX or ipconfigX).
+
+    Returns (gw4, gw4_known, gw6, gw6_known).
+    """
+    gw4 = None
+    gw6 = None
+    gw4_known = False
+    gw6_known = False
+
+    if not raw_value:
+        return gw4, gw4_known, gw6, gw6_known
+
+    for part in raw_value.split(","):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key == "gw":
+            gw4_known = True
+            gw4 = val or None
+        elif key == "gw6":
+            gw6_known = True
+            gw6 = val or None
+
+    return gw4, gw4_known, gw6, gw6_known
+
+
+def normalize_gateway_value(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def iter_vm_gateway_configs(pve_type: str, config: dict) -> List[str]:
+    if pve_type == "lxc":
+        pattern = r"^net(\d+)$"
+    else:
+        pattern = r"^ipconfig(\d+)$"
+
+    matches: List[Tuple[int, str]] = []
+    for key, value in (config or {}).items():
+        match = re.match(pattern, str(key))
+        if not match:
+            continue
+        index = int(match.group(1))
+        if value is None:
+            continue
+        matches.append((index, str(value)))
+
+    matches.sort(key=lambda item: item[0])
+    return [value for _, value in matches]
+
+
+def resolve_vm_gateways(
+    pve_type: str,
+    config: Optional[dict],
+) -> Tuple[List[str], bool, List[str], bool]:
+    if not config:
+        return [], False, [], False
+
+    gw4_values: List[str] = []
+    gw6_values: List[str] = []
+    gw4_known = False
+    gw6_known = False
+
+    for raw_value in iter_vm_gateway_configs(pve_type, config):
+        gw4, gw4_present, gw6, gw6_present = parse_gateway_settings(raw_value)
+        if gw4_present:
+            gw4_known = True
+            if gw4:
+                gw4_values.append(gw4)
+        if gw6_present:
+            gw6_known = True
+            if gw6:
+                gw6_values.append(gw6)
+
+    return gw4_values, gw4_known, gw6_values, gw6_known
 
 
 def fetch_guest_agent_interfaces(
@@ -1158,6 +1325,8 @@ def sync_vms(
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
     pool_cf_key: Optional[str],
+    gw4_cf_key: Optional[str],
+    gw6_cf_key: Optional[str],
 ) -> Tuple[Set[str], Set[int]]:
     """
     Sync all Proxmox VMs (QEMU + LXC) into NetBox virtualization.virtual_machines.
@@ -1210,6 +1379,8 @@ def sync_vms(
                 vmid_map=vmid_map,
                 vm_resource_map=vm_resource_map,
                 pool_cf_key=pool_cf_key,
+                gw4_cf_key=gw4_cf_key,
+                gw6_cf_key=gw6_cf_key,
             )
             synced_vm_names.add(name)
             synced_vm_ids.add(vmid)
@@ -1228,6 +1399,8 @@ def sync_vms(
                 vmid_map=vmid_map,
                 vm_resource_map=vm_resource_map,
                 pool_cf_key=pool_cf_key,
+                gw4_cf_key=gw4_cf_key,
+                gw6_cf_key=gw6_cf_key,
             )
             synced_vm_names.add(name)
             synced_vm_ids.add(vmid)
@@ -1248,6 +1421,8 @@ def sync_single_vm(
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
     pool_cf_key: Optional[str],
+    gw4_cf_key: Optional[str],
+    gw6_cf_key: Optional[str],
 ) -> Tuple[str, int]:
     """
     Create or update one NetBox Virtual Machine from a Proxmox VM/LXC dict
@@ -1286,10 +1461,49 @@ def sync_single_vm(
         else:
             tags_to_set = []
 
-    custom_fields_data = None
+    gw4_values, gw4_known, gw6_values, gw6_known = resolve_vm_gateways(pve_type, config)
+
+    def normalize_gateway_list(values: List[str], family: int, family_label: str) -> List[str]:
+        normalized = []
+        for raw in values:
+            raw_value = (raw or "").strip()
+            if not raw_value:
+                continue
+            try:
+                addr = ipaddress.ip_address(raw_value)
+            except ValueError:
+                LOG.warning("VM %s: invalid gateway %s '%s'; skipping", name, family_label, raw_value)
+                continue
+            if addr.version != family:
+                LOG.warning(
+                    "VM %s: gateway %s '%s' has wrong IP family; skipping",
+                    name,
+                    family_label,
+                    raw_value,
+                )
+                continue
+            normalized.append(addr)
+
+        if not normalized:
+            return []
+
+        return [str(addr) for addr in sorted(set(normalized))]
+
+    gw4_list = normalize_gateway_list(gw4_values, 4, "IPv4")
+    gw6_list = normalize_gateway_list(gw6_values, 6, "IPv6")
+    gw4_value = ", ".join(gw4_list) if gw4_list else None
+    gw6_value = ", ".join(gw6_list) if gw6_list else None
+
+    custom_fields_data = {}
     if pool_cf_key and pool_known:
         pool_value = pool if pool not in ("", None) else None
-        custom_fields_data = {pool_cf_key: pool_value}
+        custom_fields_data[pool_cf_key] = pool_value
+    if gw4_cf_key and gw4_known:
+        custom_fields_data[gw4_cf_key] = gw4_value
+    if gw6_cf_key and gw6_known:
+        custom_fields_data[gw6_cf_key] = gw6_value
+    if not custom_fields_data:
+        custom_fields_data = None
 
     # Different Proxmox endpoints expose CPU fields slightly differently
     vcpus = (
@@ -1459,12 +1673,22 @@ def main():
     role = get_nb_device_role(nb)
     dtype = get_nb_device_type(nb)
     pool_cf_key = resolve_vm_pool_custom_field_key(nb)
+    gw4_cf_key, gw6_cf_key = resolve_vm_gateway_custom_field_keys(nb)
     vm_resource_map = build_vm_resource_map(proxmox)
 
     vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
     synced_vm_names, synced_vm_ids = sync_vms(
-        nb, proxmox, cluster, node_devices, site, vmid_map, vm_resource_map, pool_cf_key
+        nb,
+        proxmox,
+        cluster,
+        node_devices,
+        site,
+        vmid_map,
+        vm_resource_map,
+        pool_cf_key,
+        gw4_cf_key,
+        gw6_cf_key,
     )
 
     if delete_missing:
