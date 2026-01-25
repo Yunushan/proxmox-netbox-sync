@@ -15,6 +15,7 @@ export NB_VERIFY_SSL="false"                 # Set true to verify TLS certs
 # Sync mode (1/safe = no deletions, 2/full = delete NetBox VMs missing in Proxmox)
 # Leave blank to be prompted when running interactively.
 export PVE_NB_SYNC_MODE=""
+export PVE_ENV_FILE="netbox_pve_env.sh"     # Optional path for auto-updating env file defaults
 export PVE_GUEST_GW_FALLBACK="true" # Use guest-agent exec to fetch gateways from VM OS
 
 # NetBox objects

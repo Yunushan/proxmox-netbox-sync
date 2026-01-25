@@ -35,6 +35,7 @@ pip install proxmoxer pynetbox requests
   - Optional VM gateway custom field keys: `NB_VM_GW4_CF` (defaults to `gateway4`), `NB_VM_GW6_CF` (defaults to `gateway6`). When enabled, the script stores gateway IPs from all LXC `netX` or QEMU cloud-init `ipconfigX` values; multiple gateways are stored as a comma-separated list. Set empty to disable. Requires NetBox custom field write permissions.
   - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
   - Optional guest gateway fallback: `PVE_GUEST_GW_FALLBACK` (defaults to `true`). When enabled, QEMU guests with `qemu-guest-agent` will be queried for default routes via guest exec to populate gateways set inside the VM OS.
+  - Optional env file auto-update path: `PVE_ENV_FILE` (defaults to `netbox_pve_env.sh`). If `PVE_GUEST_GW_FALLBACK` is missing and the env file exists, the script appends it.
 
 ### Sync modes
 

@@ -31,6 +31,33 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> Opt
     return value
 
 
+def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> None:
+    if not env_file:
+        return
+
+    try:
+        with open(env_file, "r", encoding="utf-8") as handle:
+            contents = handle.read()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        LOG.debug("Failed to read env file %s: %s", env_file, exc)
+        return
+
+    pattern = re.compile(rf"^\\s*(export\\s+)?{re.escape(key)}=", re.MULTILINE)
+    if pattern.search(contents):
+        return
+
+    try:
+        with open(env_file, "a", encoding="utf-8") as handle:
+            if contents and not contents.endswith("\n"):
+                handle.write("\n")
+            handle.write(f'export {key}="{value}"\n')
+        LOG.info("Added %s to %s", key, env_file)
+    except OSError as exc:
+        LOG.warning("Failed to update env file %s with %s: %s", env_file, key, exc)
+
+
 # ---------------------------------------------------------------------------
 # Sync mode selection
 # ---------------------------------------------------------------------------
@@ -1872,6 +1899,10 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if env(GUEST_GW_FALLBACK_ENV) is None:
+        env_file = env("PVE_ENV_FILE", "netbox_pve_env.sh")
+        ensure_env_file_setting(env_file, GUEST_GW_FALLBACK_ENV, "true")
 
     sync_mode = select_sync_mode()
     delete_missing = sync_mode == "full"
