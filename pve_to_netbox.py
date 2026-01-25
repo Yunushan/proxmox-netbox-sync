@@ -402,8 +402,8 @@ def create_vm_text_custom_field(
     attempts = [
         {**base_payload, "object_types": ["virtualization.virtualmachine"]},
         {**base_payload, "content_types": ["virtualization.virtualmachine"]},
-        {"name": pool_cf_key, "type": "text", "object_types": ["virtualization.virtualmachine"]},
-        {"name": pool_cf_key, "type": "text", "content_types": ["virtualization.virtualmachine"]},
+        {"name": field_key, "type": "text", "object_types": ["virtualization.virtualmachine"]},
+        {"name": field_key, "type": "text", "content_types": ["virtualization.virtualmachine"]},
     ]
 
     last_exc: Optional[RequestError] = None
