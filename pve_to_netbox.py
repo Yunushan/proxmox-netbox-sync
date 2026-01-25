@@ -1033,6 +1033,12 @@ def run_guest_agent_command(
     if result is None:
         stdin_payload = build_guest_exec_stdin_payload(command, arg_list)
         if stdin_payload:
+            LOG.debug(
+                "Guest exec attempting stdin payload (keys=%s) for vmid=%s on %s",
+                ",".join(stdin_payload.keys()),
+                vmid,
+                node_name,
+            )
             try:
                 result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
                 LOG.debug(
@@ -1048,6 +1054,27 @@ def run_guest_agent_command(
                     exc,
                 )
                 result = None
+
+    if result is None and arg_list:
+        combined_command = " ".join([command] + arg_list)
+        LOG.debug(
+            "Guest exec attempting combined command for vmid=%s on %s: %s",
+            vmid,
+            node_name,
+            combined_command,
+        )
+        try:
+            result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(
+                command=combined_command
+            )
+        except Exception as exc:
+            LOG.debug(
+                "Guest exec failed with combined command for vmid=%s on %s: %s",
+                vmid,
+                node_name,
+                exc,
+            )
+            result = None
 
     if result is None:
         if last_exc:
