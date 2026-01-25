@@ -6,6 +6,9 @@ export PVE_USER="netsync@pve"         # Proxmox API user (realm @pve)
 export PVE_TOKEN_NAME="sync"          # Proxmox API token ID
 export PVE_TOKEN_VALUE="YOUR_TOKEN_HERE"  # Proxmox API token secret
 export PVE_VERIFY_SSL="false"         # Set true to verify TLS certs
+export PVE_NODE_HOST_SUFFIX=""        # Optional suffix for per-node API host (e.g. ".example.com")
+export PVE_NODE_HOST_TEMPLATE=""      # Optional template (e.g. "{node}.example.com")
+export PVE_NODE_HOST_MAP=""           # Optional map (e.g. "pve1=10.0.0.1,pve2=10.0.0.2")
 
 # Netbox
 export NB_URL="https://netbox.example.com"   # NetBox base URL

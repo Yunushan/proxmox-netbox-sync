@@ -55,6 +55,10 @@ pip install proxmoxer pynetbox requests
   - If `PVE_GUEST_GW_FALLBACK` is enabled, guest-agent exec must be permitted for the token (same guest-agent access scope).
   - A simple approach: clone `PVEAuditor` and add `VM.Monitor` so guest-agent calls succeed, then assign that role to the token on the relevant nodes (or cluster-wide).
 
+- **Per-node API host selection** (guest exec compatibility on mixed versions):
+  - By default, the script derives per-node API hosts from `PVE_HOST` (e.g. `pve1.example.com` -> `pve2.example.com`).
+  - Override with `PVE_NODE_HOST_SUFFIX`, `PVE_NODE_HOST_TEMPLATE`, or `PVE_NODE_HOST_MAP` when node names do not resolve via DNS.
+
 - **Proxmox guest agent inside VMs**:
   - Install and enable `qemu-guest-agent` so IP discovery works. Without it, VMs are still synced but IPs remain empty.
 

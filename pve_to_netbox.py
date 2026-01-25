@@ -6,6 +6,8 @@ import re
 import base64
 import binascii
 import time
+from functools import lru_cache
+from urllib.parse import urlsplit
 from typing import Dict, Optional, List, Tuple, Set
 
 import requests
@@ -29,6 +31,82 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> Opt
     if required and not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def split_host_port(value: str) -> Tuple[str, Optional[int]]:
+    if not value:
+        return "", None
+
+    raw = value.strip()
+    hostport = raw
+    if "://" in raw:
+        parts = urlsplit(raw)
+        hostport = parts.netloc or parts.path
+
+    host = hostport
+    port: Optional[int] = None
+
+    if hostport.startswith("[") and "]" in hostport:
+        host = hostport[1:hostport.index("]")]
+        remainder = hostport[hostport.index("]") + 1 :]
+        if remainder.startswith(":"):
+            port_part = remainder[1:]
+            if port_part.isdigit():
+                port = int(port_part)
+    elif hostport.count(":") == 1:
+        host_part, port_part = hostport.rsplit(":", 1)
+        if port_part.isdigit():
+            host = host_part
+            port = int(port_part)
+
+    return host, port
+
+
+def parse_node_host_map(value: Optional[str]) -> Dict[str, Tuple[str, Optional[int]]]:
+    mapping: Dict[str, Tuple[str, Optional[int]]] = {}
+    if not value:
+        return mapping
+
+    for item in value.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        node, host_value = item.split("=", 1)
+        node = node.strip()
+        host_value = host_value.strip()
+        if not node or not host_value:
+            continue
+        host, port = split_host_port(host_value)
+        if host:
+            mapping[node] = (host, port)
+
+    return mapping
+
+
+@lru_cache(maxsize=None)
+def resolve_node_host_details(node_name: str) -> Tuple[str, Optional[int]]:
+    node_map = parse_node_host_map(env("PVE_NODE_HOST_MAP"))
+    if node_name in node_map:
+        return node_map[node_name]
+
+    template = env("PVE_NODE_HOST_TEMPLATE")
+    if template:
+        host_value = template.format(node=node_name)
+        host, port = split_host_port(host_value)
+        return host, port
+
+    suffix = env("PVE_NODE_HOST_SUFFIX")
+    base_host_raw = env("PVE_HOST", "") or ""
+    base_host, base_port = split_host_port(base_host_raw)
+
+    if suffix:
+        return f"{node_name}{suffix}", base_port
+
+    if base_host and "." in base_host and "." not in node_name:
+        base_suffix = base_host[base_host.find(".") :]
+        return f"{node_name}{base_suffix}", base_port
+
+    return node_name, base_port
 
 
 def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> None:
@@ -124,23 +202,35 @@ def select_sync_mode() -> str:
 # Connections
 # ---------------------------------------------------------------------------
 
-def connect_proxmox() -> ProxmoxAPI:
-    host = env("PVE_HOST", required=True)             # hostname / IP of a node
+def connect_proxmox(
+    host_override: Optional[str] = None,
+    port_override: Optional[int] = None,
+) -> ProxmoxAPI:
+    host_value = host_override or env("PVE_HOST", required=True)  # hostname / IP of a node
+    host, port = split_host_port(host_value)
+    if not host:
+        raise SystemExit("Invalid PVE_HOST value (empty)")
     user = env("PVE_USER", required=True)             # e.g. netsync@pve
     token_name = env("PVE_TOKEN_NAME", required=True) # token ID
     token_value = env("PVE_TOKEN_VALUE", required=True)
     verify_ssl = env("PVE_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
 
+    if port_override is not None:
+        port = port_override
+
     LOG.info("Connecting to Proxmox at %s as %s", host, user)
 
-    proxmox = ProxmoxAPI(
-        host,
-        user=user,
-        token_name=token_name,
-        token_value=token_value,
-        verify_ssl=verify_ssl,
-        service="PVE",
-    )
+    proxmox_kwargs = {
+        "user": user,
+        "token_name": token_name,
+        "token_value": token_value,
+        "verify_ssl": verify_ssl,
+        "service": "PVE",
+    }
+    if port:
+        proxmox_kwargs["port"] = port
+
+    proxmox = ProxmoxAPI(host, **proxmox_kwargs)
     return proxmox
 
 
@@ -158,6 +248,34 @@ def connect_netbox():
     nb = pynetbox.api(url=url, token=token)
     nb.http_session = session
     return nb
+
+
+# ---------------------------------------------------------------------------
+# Per-node Proxmox connections (guest agent exec compatibility)
+# ---------------------------------------------------------------------------
+
+NODE_PROXMOX_CACHE: Dict[str, ProxmoxAPI] = {}
+
+
+def get_node_proxmox(base_proxmox: ProxmoxAPI, node_name: str) -> ProxmoxAPI:
+    host, port = resolve_node_host_details(node_name)
+    if not host:
+        return base_proxmox
+
+    cache_key = f"{host}:{port}" if port else host
+    if cache_key in NODE_PROXMOX_CACHE:
+        return NODE_PROXMOX_CACHE[cache_key]
+
+    base_host_raw = env("PVE_HOST", "") or ""
+    base_host, base_port = split_host_port(base_host_raw)
+    if host == base_host and (port or None) == base_port:
+        NODE_PROXMOX_CACHE[cache_key] = base_proxmox
+        return base_proxmox
+
+    LOG.debug("Using per-node API host %s for node %s", cache_key, node_name)
+    node_proxmox = connect_proxmox(host_override=host, port_override=port)
+    NODE_PROXMOX_CACHE[cache_key] = node_proxmox
+    return node_proxmox
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +1001,8 @@ def run_guest_agent_command(
     if pve_type != "qemu":
         return None
 
+    node_proxmox = get_node_proxmox(proxmox, node_name)
+
     arg_list = args or []
     payloads = [
         {"command": command, "arg": arg_list, "capture-output": 1},
@@ -897,7 +1017,7 @@ def run_guest_agent_command(
     last_exc: Optional[Exception] = None
     for payload in payloads:
         try:
-            result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
+            result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**payload)
             break
         except Exception as exc:
             last_exc = exc
@@ -914,7 +1034,7 @@ def run_guest_agent_command(
         stdin_payload = build_guest_exec_stdin_payload(command, arg_list)
         if stdin_payload:
             try:
-                result = proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
+                result = node_proxmox.nodes(node_name).qemu(vmid).agent("exec").post(**stdin_payload)
                 LOG.debug(
                     "Guest exec succeeded using stdin payload for vmid=%s on %s",
                     vmid,
@@ -948,7 +1068,7 @@ def run_guest_agent_command(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            status = proxmox.nodes(node_name).qemu(vmid).agent("exec-status").get(pid=pid)
+            status = node_proxmox.nodes(node_name).qemu(vmid).agent("exec-status").get(pid=pid)
         except Exception as exc:
             LOG.debug("Guest exec status failed for vmid=%s on %s: %s", vmid, node_name, exc)
             return None
@@ -991,8 +1111,10 @@ def fetch_guest_osinfo(
     if pve_type != "qemu":
         return None
 
+    node_proxmox = get_node_proxmox(proxmox, node_name)
+
     try:
-        result = proxmox.nodes(node_name).qemu(vmid).agent("get-osinfo").get()
+        result = node_proxmox.nodes(node_name).qemu(vmid).agent("get-osinfo").get()
     except Exception:
         return None
 
@@ -1108,8 +1230,10 @@ def fetch_guest_agent_interfaces(
     if pve_type != "qemu":
         return []
 
+    node_proxmox = get_node_proxmox(proxmox, node_name)
+
     try:
-        result = proxmox.nodes(node_name).qemu(vmid).agent("network-get-interfaces").get()
+        result = node_proxmox.nodes(node_name).qemu(vmid).agent("network-get-interfaces").get()
     except Exception as exc:
         LOG.debug("No guest-agent data for vmid=%s on %s: %s", vmid, node_name, exc)
         return []
