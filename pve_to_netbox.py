@@ -1966,6 +1966,7 @@ def map_netbox_vms_by_vmid(nb, cluster) -> Dict[int, object]:
 # ---------------------------------------------------------------------------
 
 DISK_KEY_PREFIXES = ("scsi", "sata", "virtio", "ide", "efidisk", "unused")
+BOOT_DISK_PREFIXES = ("scsi", "sata", "virtio", "ide")
 
 
 def parse_disk_sizes_from_config(config: dict) -> int:
@@ -2052,6 +2053,21 @@ def is_cdrom_value(value: str) -> bool:
 def is_disk_config_key(key: str, value: Optional[object]) -> bool:
     key_l = str(key).lower()
     if not key_l.startswith(DISK_KEY_PREFIXES):
+        return False
+    if not isinstance(value, str):
+        return False
+    if is_cdrom_value(value):
+        return False
+    return True
+
+
+def is_boot_disk_config_key(key: str, value: Optional[object]) -> bool:
+    key_l = str(key).lower()
+    if not key_l.startswith(BOOT_DISK_PREFIXES):
+        return False
+    if key_l.startswith("unused"):
+        return False
+    if key_l.startswith("efidisk") or key_l.startswith("tpmstate"):
         return False
     if not isinstance(value, str):
         return False
@@ -2222,7 +2238,7 @@ def resolve_boot_disk(pve_type: str, config: Optional[dict]) -> Optional[str]:
         return None
 
     bootdisk = normalize_text(config.get("bootdisk"))
-    if bootdisk:
+    if bootdisk and not bootdisk.lower().startswith("unused"):
         return bootdisk
 
     boot = normalize_text(config.get("boot"))
@@ -2236,12 +2252,27 @@ def resolve_boot_disk(pve_type: str, config: Optional[dict]) -> Optional[str]:
             if not item:
                 continue
             value = config.get(item)
-            if is_disk_config_key(item, value):
+            if is_boot_disk_config_key(item, value):
                 return item
 
+    candidates: List[Tuple[int, int, str]] = []
     for key, value in config.items():
-        if is_disk_config_key(key, value):
-            return str(key)
+        if not is_boot_disk_config_key(key, value):
+            continue
+        key_s = str(key)
+        key_l = key_s.lower()
+        match = re.match(r"([a-z]+)(\\d+)$", key_l)
+        if match:
+            prefix, idx_raw = match.groups()
+            idx = int(idx_raw)
+        else:
+            prefix, idx = key_l, 999
+        prefix_rank = BOOT_DISK_PREFIXES.index(prefix) if prefix in BOOT_DISK_PREFIXES else 99
+        candidates.append((prefix_rank, idx, key_s))
+
+    if candidates:
+        candidates.sort()
+        return candidates[0][2]
 
     return None
 
@@ -2278,6 +2309,8 @@ def parse_disk_config_value(value: Optional[object]) -> Dict[str, Optional[str]]
         ext = os.path.splitext(volume)[1].lower().lstrip(".")
         if ext in ("qcow2", "raw", "vmdk", "vhdx", "img"):
             fmt = ext
+        elif ext == "":
+            fmt = "raw"
 
     return {
         "storage": normalize_text(storage),
@@ -2356,6 +2389,9 @@ def resolve_qemu_boot_order(pve_type: str, config: Optional[dict]) -> Optional[s
 
 
 def resolve_qemu_machine_type(
+    proxmox: Optional[ProxmoxAPI],
+    node_name: Optional[str],
+    vmid: Optional[int],
     pve_type: str,
     config: Optional[dict],
     vm: Optional[dict],
@@ -2363,7 +2399,20 @@ def resolve_qemu_machine_type(
     if pve_type != "qemu":
         return None
     config = config or {}
-    return normalize_text(config.get("machine") or (vm or {}).get("machine"))
+    machine = normalize_text(config.get("machine") or (vm or {}).get("machine"))
+    if machine:
+        return machine
+
+    if proxmox and node_name and vmid is not None:
+        try:
+            status = proxmox.nodes(node_name).qemu(vmid).status.current.get()
+            machine = normalize_text(status.get("machine"))
+            if machine:
+                return machine
+        except Exception as exc:
+            LOG.debug("Failed to fetch machine type from status.current for vmid=%s: %s", vmid, exc)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2892,7 +2941,7 @@ def sync_single_vm(
     qemu_numa_status = resolve_qemu_numa_status(pve_type, config)
     qemu_bios = resolve_qemu_bios_type(pve_type, config, vm)
     qemu_boot_order = resolve_qemu_boot_order(pve_type, config)
-    qemu_machine = resolve_qemu_machine_type(pve_type, config, vm)
+    qemu_machine = resolve_qemu_machine_type(proxmox, node_name, vmid, pve_type, config, vm)
     qemu_cpu_type = cpu_type if pve_type == "qemu" else None
     qemu_cores_per_socket = cores if pve_type == "qemu" else None
 
