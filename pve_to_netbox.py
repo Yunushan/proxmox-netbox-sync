@@ -804,6 +804,10 @@ def resolve_vm_custom_field_spec(
             exc,
         )
         return None
+    if not cf:
+        cf = find_custom_field_by_label(nb, field_key, preferred_key=field_key)
+    if not cf and label and label != field_key:
+        cf = find_custom_field_by_label(nb, label, preferred_key=field_key)
 
     if not cf:
         LOG.warning(
@@ -819,17 +823,19 @@ def resolve_vm_custom_field_spec(
             )
             return None
 
-    if not ensure_vm_custom_field_attached(nb, cf, field_key):
+    resolved_key = getattr(cf, "name", None) or field_key
+
+    if not ensure_vm_custom_field_attached(nb, cf, resolved_key):
         LOG.warning(
             "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
             "%s sync disabled",
-            field_key,
+            resolved_key,
             label,
         )
         return None
 
     resolved_type = getattr(cf, "type", None) or field_type
-    return {"key": field_key, "type": resolved_type}
+    return {"key": resolved_key, "type": resolved_type}
 
 
 def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
@@ -978,6 +984,87 @@ def normalize_custom_field_type(field_type: Optional[object]) -> str:
             return candidate.lower()
 
     return str(field_type).lower()
+
+
+def find_custom_field_by_label(
+    nb,
+    label_value: Optional[str],
+    preferred_key: Optional[str] = None,
+) -> Optional[object]:
+    if not label_value:
+        return None
+
+    try:
+        matches = list(nb.extras.custom_fields.filter(label=label_value))
+    except Exception as exc:
+        LOG.debug("Failed to query NetBox custom fields by label '%s': %s", label_value, exc)
+        matches = []
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        preferred = select_custom_field_by_key(matches, preferred_key) or select_custom_field_by_key(
+            matches, label_value
+        )
+        if preferred:
+            return preferred
+        LOG.warning(
+            "Multiple NetBox custom fields match label '%s'; skipping label match",
+            label_value,
+        )
+        return None
+
+    # Fallback: case-insensitive label scan (NetBox label filters may be case-sensitive).
+    try:
+        all_fields = list(nb.extras.custom_fields.filter())
+    except Exception as exc:
+        LOG.debug("Failed to list NetBox custom fields for label scan: %s", exc)
+        return None
+
+    target = label_value.strip().lower()
+    if not target:
+        return None
+
+    matches = [cf for cf in all_fields if str(getattr(cf, "label", "")).strip().lower() == target]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        preferred = select_custom_field_by_key(matches, preferred_key) or select_custom_field_by_key(
+            matches, label_value
+        )
+        if preferred:
+            return preferred
+        LOG.warning(
+            "Multiple NetBox custom fields match label '%s' (case-insensitive); skipping",
+            label_value,
+        )
+        return None
+    return None
+
+
+def select_custom_field_by_key(candidates: List[object], preferred_key: Optional[str]) -> Optional[object]:
+    if not preferred_key:
+        return None
+
+    key = str(preferred_key).strip().lower()
+    if not key:
+        return None
+
+    for cf in candidates:
+        name = str(getattr(cf, "name", "")).strip().lower()
+        if name == key:
+            return cf
+
+    tokens = [t for t in re.split(r"[^a-z0-9]+", key) if t]
+    if not tokens:
+        return None
+
+    for cf in candidates:
+        name = str(getattr(cf, "name", "")).strip().lower()
+        if all(token in name for token in tokens):
+            return cf
+
+    return None
 
 
 def set_custom_field_value(
