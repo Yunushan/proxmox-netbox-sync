@@ -2408,6 +2408,11 @@ def resolve_qemu_machine_type(
     if machine:
         return machine
 
+    args = config.get("args")
+    machine = parse_machine_from_args(args)
+    if machine:
+        return machine
+
     if proxmox and node_name and vmid is not None:
         try:
             node_proxmox = get_node_proxmox(proxmox, node_name)
@@ -2418,6 +2423,33 @@ def resolve_qemu_machine_type(
         except Exception as exc:
             LOG.debug("Failed to fetch machine type from status.current for vmid=%s: %s", vmid, exc)
 
+        try:
+            node_proxmox = get_node_proxmox(proxmox, node_name)
+            current_cfg = node_proxmox.nodes(node_name).qemu(vmid).config.get(current=1)
+            machine = normalize_text(
+                current_cfg.get("machine") or current_cfg.get("machine-type")
+            )
+            if machine:
+                return machine
+            machine = parse_machine_from_args(current_cfg.get("args"))
+            if machine:
+                return machine
+        except Exception as exc:
+            LOG.debug("Failed to fetch machine type from config current=1 for vmid=%s: %s", vmid, exc)
+
+    return None
+
+
+def parse_machine_from_args(args: Optional[object]) -> Optional[str]:
+    if not args or not isinstance(args, str):
+        return None
+    # Match: -machine pc-q35-7.2 | -machine=pc-q35-7.2 | -M pc-q35-7.2 | -Mpc-q35-7.2
+    match = re.search(r"(?:-machine\\s+|-machine=)([^\\s]+)", args)
+    if match:
+        return normalize_text(match.group(1))
+    match = re.search(r"(?:-M\\s+|-M)([^\\s]+)", args)
+    if match:
+        return normalize_text(match.group(1))
     return None
 
 
