@@ -2437,7 +2437,7 @@ def resolve_qemu_machine_type(
         except Exception as exc:
             LOG.debug("Failed to fetch machine type from config current=1 for vmid=%s: %s", vmid, exc)
 
-    return None
+    return infer_default_qemu_machine(config)
 
 
 def parse_machine_from_args(args: Optional[object]) -> Optional[str]:
@@ -2451,6 +2451,20 @@ def parse_machine_from_args(args: Optional[object]) -> Optional[str]:
     if match:
         return normalize_text(match.group(1))
     return None
+
+
+def infer_default_qemu_machine(config: Optional[dict]) -> Optional[str]:
+    config = config or {}
+    bios = normalize_text(config.get("bios"))
+    if bios == "ovmf":
+        return "q35"
+
+    for key in config.keys():
+        key_l = str(key).lower()
+        if key_l.startswith("efidisk"):
+            return "q35"
+
+    return "i440fx"
 
 
 # ---------------------------------------------------------------------------
