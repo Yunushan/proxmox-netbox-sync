@@ -953,7 +953,7 @@ def cast_custom_field_value(value: Optional[object], field_type: str) -> Optiona
     if value is None:
         return None
 
-    field_type = (field_type or "text").lower()
+    field_type = normalize_custom_field_type(field_type)
     if field_type == "integer":
         return parse_int(value)
     if field_type == "boolean":
@@ -961,6 +961,23 @@ def cast_custom_field_value(value: Optional[object], field_type: str) -> Optiona
         return parsed if parsed is not None else None
 
     return str(value)
+
+
+def normalize_custom_field_type(field_type: Optional[object]) -> str:
+    if not field_type:
+        return "text"
+    if isinstance(field_type, str):
+        return field_type.lower()
+
+    for attr in ("value", "name", "label", "slug"):
+        try:
+            candidate = getattr(field_type, attr)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, str) and candidate:
+            return candidate.lower()
+
+    return str(field_type).lower()
 
 
 def set_custom_field_value(
