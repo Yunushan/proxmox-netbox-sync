@@ -33,6 +33,19 @@ pip install proxmoxer pynetbox requests
   - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; auto-created and auto-attached to VMs if missing, requires NetBox custom field write permissions)
   - Optional VM gateway custom field keys: `NB_VM_GW4_CF` (defaults to `gateway4`), `NB_VM_GW6_CF` (defaults to `gateway6`). When enabled, the script stores gateway IPs from all LXC `netX` or QEMU cloud-init `ipconfigX` values; multiple gateways are stored as a comma-separated list. Set empty to disable. Requires NetBox custom field write permissions.
+  - Optional VM metadata custom field keys (auto-created/attached if missing; set empty to disable; requires NetBox custom field write permissions):
+    - `NB_VM_VMID_CF` (defaults to `vmid`)
+    - `NB_VM_SOCKETS_CF` (defaults to `sockets`)
+    - `NB_VM_CORES_CF` (defaults to `cores`)
+    - `NB_VM_CPU_TYPE_CF` (defaults to `cpu_type`)
+    - `NB_VM_OS_TYPE_CF` (defaults to `os_type`)
+    - `NB_VM_DESCRIPTION_CF` (defaults to `pve_description`)
+    - `NB_VM_BOOT_DISK_CF` (defaults to `boot_disk`)
+    - `NB_VM_GUEST_AGENT_CF` (defaults to `guest_agent_status`, uses enabled/disabled from Proxmox config)
+    - `NB_VM_QEMU_NUMA_CF` (defaults to `qemu_numa`, QEMU-only)
+    - `NB_VM_QEMU_MACHINE_CF` (defaults to `qemu_machine`, QEMU-only)
+    - `NB_VM_LAST_SYNC_CF` (defaults to `last_sync`, timestamp)
+    - `NB_VM_LAST_SYNC_TZ` (defaults to `+03:00`; set `local` to use system time)
   - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
   - Optional guest gateway fallback: `PVE_GUEST_GW_FALLBACK` (defaults to `true`). When enabled, QEMU guests with `qemu-guest-agent` will be queried for default routes via guest exec to populate gateways set inside the VM OS.
   - Optional env file auto-update path: `PVE_ENV_FILE` (defaults to `netbox_pve_env.sh`). If `PVE_GUEST_GW_FALLBACK` is missing and the env file exists, the script appends it.
