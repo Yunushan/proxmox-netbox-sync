@@ -2100,9 +2100,108 @@ def resolve_vm_cpu_info(
     return vcpus, cores, sockets, cpu_type
 
 
-def resolve_vm_os_type(vm: dict, config: Optional[dict]) -> Optional[str]:
+def format_guest_os_name(osinfo: Optional[dict]) -> Optional[str]:
+    if not osinfo:
+        return None
+
+    for key in ("pretty-name", "pretty_name", "prettyName"):
+        value = osinfo.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    name = osinfo.get("name")
+    version = osinfo.get("version") or osinfo.get("version-id")
+    if isinstance(name, str) and name.strip():
+        if isinstance(version, str) and version.strip():
+            return f"{name.strip()} {version.strip()}"
+        return name.strip()
+
+    os_id = osinfo.get("id")
+    if isinstance(os_id, str) and os_id.strip():
+        return os_id.strip()
+
+    return None
+
+
+def map_pve_ostype(code: Optional[str], pve_type: str) -> Optional[str]:
+    if not code:
+        return None
+    key = str(code).strip().lower()
+    if not key:
+        return None
+
+    qemu_map = {
+        "l26": "Linux",
+        "l24": "Linux 2.4",
+        "l16": "Linux 2.2",
+        "otherlinux": "Linux",
+        "win11": "Windows 11",
+        "win10": "Windows 10",
+        "win8": "Windows 8/8.1",
+        "win7": "Windows 7",
+        "w2k": "Windows 2000",
+        "wxp": "Windows XP",
+        "w2k3": "Windows Server 2003",
+        "win2k8": "Windows Server 2008",
+        "win2k8r2": "Windows Server 2008 R2",
+        "win2k12": "Windows Server 2012",
+        "win2k12r2": "Windows Server 2012 R2",
+        "win2k16": "Windows Server 2016",
+        "win2k19": "Windows Server 2019",
+        "win2k22": "Windows Server 2022",
+        "solaris": "Solaris",
+        "opensolaris": "OpenSolaris",
+        "freebsd": "FreeBSD",
+        "netbsd": "NetBSD",
+        "openbsd": "OpenBSD",
+        "other": "Other",
+    }
+
+    lxc_map = {
+        "alpine": "Alpine Linux",
+        "archlinux": "Arch Linux",
+        "amazon": "Amazon Linux",
+        "centos": "CentOS",
+        "debian": "Debian",
+        "fedora": "Fedora Linux",
+        "gentoo": "Gentoo Linux",
+        "nixos": "NixOS",
+        "oracle": "Oracle Linux",
+        "opensuse": "openSUSE",
+        "rocky": "Rocky Linux",
+        "almalinux": "AlmaLinux",
+        "ubuntu": "Ubuntu",
+        "void": "Void Linux",
+        "openwrt": "OpenWrt",
+    }
+
+    # If Proxmox reports a QEMU-style ostype (like l26), map it regardless of VM type.
+    if key in qemu_map:
+        return qemu_map[key]
+
+    if pve_type == "lxc":
+        return lxc_map.get(key, key.replace("_", " ").replace("-", " ").title())
+
+    return qemu_map.get(key, key.replace("_", " ").replace("-", " ").title())
+
+
+def resolve_vm_os_type(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+    vm: dict,
+    config: Optional[dict],
+) -> Optional[str]:
+    if pve_type == "qemu":
+        osinfo = fetch_guest_osinfo(proxmox, node_name, vmid, pve_type)
+        pretty = format_guest_os_name(osinfo)
+        if pretty:
+            return pretty
+
     config = config or {}
-    return normalize_text(config.get("ostype") or vm.get("ostype"))
+    raw = normalize_text(config.get("ostype") or vm.get("ostype"))
+    return map_pve_ostype(raw, pve_type)
 
 
 def resolve_vm_description(vm: dict, config: Optional[dict]) -> Optional[str]:
@@ -2783,7 +2882,7 @@ def sync_single_vm(
     gw6_value = ", ".join(gw6_list) if gw6_list else None
 
     vcpus, cores, sockets, cpu_type = resolve_vm_cpu_info(vm, config, pve_type)
-    os_type = resolve_vm_os_type(vm, config)
+    os_type = resolve_vm_os_type(proxmox, node_name, vmid, pve_type, vm, config)
     description = resolve_vm_description(vm, config)
     boot_disk = resolve_boot_disk(pve_type, config)
     boot_disk_storage, boot_disk_format, _boot_volume = resolve_boot_disk_details(

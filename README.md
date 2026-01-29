@@ -39,7 +39,7 @@ pip install proxmoxer pynetbox requests
     - `NB_VM_CORES_CF` (defaults to `cores`)
     - `NB_VM_CPU_TYPE_CF` (defaults to `cpu_type`)
     - `NB_VM_QEMU_CPU_TYPE_CF` (defaults to `qemu_cpu_type`)
-    - `NB_VM_OS_TYPE_CF` (defaults to `os_type`)
+    - `NB_VM_OS_TYPE_CF` (defaults to `os_type`; QEMU uses guest-agent "pretty-name" when available, otherwise Proxmox ostype)
     - `NB_VM_DESCRIPTION_CF` (defaults to `pve_description`)
     - `NB_VM_BOOT_DISK_CF` (defaults to `boot_disk`)
     - `NB_VM_BOOT_DISK_FORMAT_CF` (defaults to `boot_disk_format`)
