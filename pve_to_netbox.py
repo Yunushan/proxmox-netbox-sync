@@ -2399,13 +2399,19 @@ def resolve_qemu_machine_type(
     if pve_type != "qemu":
         return None
     config = config or {}
-    machine = normalize_text(config.get("machine") or (vm or {}).get("machine"))
+    machine = normalize_text(
+        config.get("machine")
+        or config.get("machine-type")
+        or (vm or {}).get("machine")
+        or (vm or {}).get("machine_type")
+    )
     if machine:
         return machine
 
     if proxmox and node_name and vmid is not None:
         try:
-            status = proxmox.nodes(node_name).qemu(vmid).status.current.get()
+            node_proxmox = get_node_proxmox(proxmox, node_name)
+            status = node_proxmox.nodes(node_name).qemu(vmid).status.current.get()
             machine = normalize_text(status.get("machine"))
             if machine:
                 return machine
