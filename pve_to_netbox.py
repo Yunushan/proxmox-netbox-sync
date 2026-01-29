@@ -790,11 +790,61 @@ def resolve_vm_custom_field_spec(
     description: str,
     default_key: Optional[str] = None,
     field_type: str = "text",
-) -> Optional[dict]:
-    field_key = (env(env_var, default_key) or "").strip()
-    if not field_key:
+) -> Optional[List[dict]]:
+    field_key_raw = (env(env_var, default_key) or "").strip()
+    if not field_key_raw:
+        return None
+    field_keys = [key.strip() for key in field_key_raw.split(",") if key.strip()]
+    if not field_keys:
         return None
 
+    specs: List[dict] = []
+    seen_keys: Set[str] = set()
+
+    def add_cf(cf_obj: object, fallback_type: str) -> None:
+        resolved_key = getattr(cf_obj, "name", None)
+        if not resolved_key:
+            return
+        key_norm = str(resolved_key).strip().lower()
+        if not key_norm or key_norm in seen_keys:
+            return
+        if not custom_field_attached_to_vm(nb, cf_obj):
+            if not ensure_vm_custom_field_attached(nb, cf_obj, resolved_key):
+                LOG.warning(
+                    "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
+                    "%s sync disabled",
+                    resolved_key,
+                    label,
+                )
+                return
+        seen_keys.add(key_norm)
+        resolved_type = getattr(cf_obj, "type", None) or fallback_type
+        specs.append({"key": resolved_key, "type": resolved_type})
+
+    # If multiple keys were explicitly provided, honor them as-is.
+    if len(field_keys) > 1:
+        for field_key in field_keys:
+            try:
+                cf = nb.extras.custom_fields.get(name=field_key)
+            except Exception as exc:
+                LOG.warning(
+                    "Unable to query NetBox custom fields; %s sync disabled: %s",
+                    label,
+                    exc,
+                )
+                return None
+            if not cf:
+                cf = find_custom_field_by_label(nb, field_key, preferred_key=field_key)
+            if cf:
+                add_cf(cf, field_type)
+            else:
+                LOG.warning(
+                    "NetBox custom field '%s' not found; skipping",
+                    field_key,
+                )
+        return specs or None
+
+    field_key = field_keys[0]
     try:
         cf = nb.extras.custom_fields.get(name=field_key)
     except Exception as exc:
@@ -804,41 +854,46 @@ def resolve_vm_custom_field_spec(
             exc,
         )
         return None
+
     if not cf:
         cf = find_custom_field_by_label(nb, field_key, preferred_key=field_key)
     if not cf and label and label != field_key:
         cf = find_custom_field_by_label(nb, label, preferred_key=field_key)
 
+    if cf:
+        add_cf(cf, field_type)
+        cf_label = getattr(cf, "label", None)
+        if cf_label:
+            for extra in find_custom_fields_by_label(nb, cf_label):
+                add_cf(extra, field_type)
+        return specs or None
+
+    label_matches = find_custom_fields_by_label(nb, label or field_key)
+    attached_matches = [match for match in label_matches if custom_field_attached_to_vm(nb, match)]
+    for match in attached_matches or label_matches:
+        add_cf(match, field_type)
+
+    if specs:
+        return specs
+
+    LOG.warning(
+        "NetBox custom field '%s' not found; attempting to auto-create",
+        field_key,
+    )
+    cf = create_vm_custom_field(nb, field_key, label, description, field_type=field_type)
     if not cf:
         LOG.warning(
-            "NetBox custom field '%s' not found; attempting to auto-create",
-            field_key,
-        )
-        cf = create_vm_custom_field(nb, field_key, label, description, field_type=field_type)
-        if not cf:
-            LOG.warning(
-                "%s sync disabled; custom field '%s' could not be created",
-                label,
-                field_key,
-            )
-            return None
-
-    resolved_key = getattr(cf, "name", None) or field_key
-
-    if not ensure_vm_custom_field_attached(nb, cf, resolved_key):
-        LOG.warning(
-            "NetBox custom field '%s' is not attached to virtualization.virtualmachine; "
-            "%s sync disabled",
-            resolved_key,
+            "%s sync disabled; custom field '%s' could not be created",
             label,
+            field_key,
         )
         return None
 
-    resolved_type = getattr(cf, "type", None) or field_type
-    return {"key": resolved_key, "type": resolved_type}
+    add_cf(cf, field_type)
+    return specs or None
 
 
-def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
+def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[List[dict]]]:
     return {
         "pool": resolve_vm_custom_field_spec(
             nb,
@@ -896,6 +951,14 @@ def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
             default_key="cpu_type",
             field_type="text",
         ),
+        "qemu_cpu_type": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_QEMU_CPU_TYPE_CF",
+            "QEMU CPU Type",
+            "Proxmox QEMU CPU type",
+            default_key="qemu_cpu_type",
+            field_type="text",
+        ),
         "os_type": resolve_vm_custom_field_spec(
             nb,
             "NB_VM_OS_TYPE_CF",
@@ -920,6 +983,22 @@ def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
             default_key="boot_disk",
             field_type="text",
         ),
+        "boot_disk_format": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_BOOT_DISK_FORMAT_CF",
+            "Boot Disk Format",
+            "Proxmox VM boot disk format",
+            default_key="boot_disk_format",
+            field_type="text",
+        ),
+        "boot_disk_storage": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_BOOT_DISK_STORAGE_CF",
+            "Boot Disk Storage",
+            "Proxmox VM boot disk storage",
+            default_key="boot_disk_storage",
+            field_type="text",
+        ),
         "guest_agent": resolve_vm_custom_field_spec(
             nb,
             "NB_VM_GUEST_AGENT_CF",
@@ -928,6 +1007,54 @@ def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
             default_key="guest_agent_status",
             field_type="text",
         ),
+        "memory_mb": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_MEMORY_MB_CF",
+            "Memory (MB)",
+            "Proxmox VM memory in MB",
+            default_key="memory_mb",
+            field_type="integer",
+        ),
+        "vm_node": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_NODE_CF",
+            "VM Node",
+            "Proxmox VM node",
+            default_key="vm_node",
+            field_type="text",
+        ),
+        "vm_status": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_STATUS_CF",
+            "VM Status",
+            "Proxmox VM status",
+            default_key="vm_status",
+            field_type="text",
+        ),
+        "vm_tags": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_TAGS_CF",
+            "Tags",
+            "Proxmox VM tags (comma-separated)",
+            default_key="vm_tags",
+            field_type="text",
+        ),
+        "cpu_sockets": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_CPU_SOCKETS_CF",
+            "CPU Sockets",
+            "Proxmox VM CPU sockets",
+            default_key="cpu_sockets",
+            field_type="integer",
+        ),
+        "qemu_cores_per_socket": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_QEMU_CORES_PER_SOCKET_CF",
+            "QEMU Cores per Socket",
+            "Proxmox QEMU cores per socket",
+            default_key="qemu_cores_per_socket",
+            field_type="integer",
+        ),
         "qemu_numa": resolve_vm_custom_field_spec(
             nb,
             "NB_VM_QEMU_NUMA_CF",
@@ -935,6 +1062,22 @@ def resolve_vm_custom_field_specs(nb) -> Dict[str, Optional[dict]]:
             "Proxmox QEMU NUMA setting",
             default_key="qemu_numa",
             field_type="boolean",
+        ),
+        "qemu_bios": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_QEMU_BIOS_CF",
+            "QEMU BIOS Type",
+            "Proxmox QEMU BIOS type",
+            default_key="qemu_bios",
+            field_type="text",
+        ),
+        "qemu_boot_order": resolve_vm_custom_field_spec(
+            nb,
+            "NB_VM_QEMU_BOOT_ORDER_CF",
+            "QEMU Boot Order",
+            "Proxmox QEMU boot order",
+            default_key="qemu_boot_order",
+            field_type="text",
         ),
         "qemu_machine": resolve_vm_custom_field_spec(
             nb,
@@ -986,13 +1129,25 @@ def normalize_custom_field_type(field_type: Optional[object]) -> str:
     return str(field_type).lower()
 
 
-def find_custom_field_by_label(
-    nb,
-    label_value: Optional[str],
-    preferred_key: Optional[str] = None,
-) -> Optional[object]:
+def custom_field_attached_to_vm(nb, cf: object) -> bool:
+    target_type = "virtualization.virtualmachine"
+    raw_object_types = getattr(cf, "object_types", None)
+    raw_content_types = getattr(cf, "content_types", None)
+    raw_types = raw_object_types if raw_object_types is not None else raw_content_types
+
+    normalized, has_int, has_str = normalize_content_type_list(raw_types)
+    if has_str and target_type in normalized:
+        return True
+    if has_int:
+        ct_id = get_vm_content_type_id(nb)
+        if ct_id and ct_id in normalized:
+            return True
+    return False
+
+
+def find_custom_fields_by_label(nb, label_value: Optional[str]) -> List[object]:
     if not label_value:
-        return None
+        return []
 
     try:
         matches = list(nb.extras.custom_fields.filter(label=label_value))
@@ -1000,6 +1155,35 @@ def find_custom_field_by_label(
         LOG.debug("Failed to query NetBox custom fields by label '%s': %s", label_value, exc)
         matches = []
 
+    if matches:
+        return matches
+
+    # Fallback: case-insensitive label scan (NetBox label filters may be case-sensitive).
+    try:
+        all_fields = list(nb.extras.custom_fields.filter())
+    except Exception as exc:
+        LOG.debug("Failed to list NetBox custom fields for label scan: %s", exc)
+        return []
+
+    target = label_value.strip().lower()
+    if not target:
+        return []
+
+    return [
+        cf
+        for cf in all_fields
+        if str(getattr(cf, "label", "")).strip().lower() == target
+    ]
+
+
+def find_custom_field_by_label(
+    nb,
+    label_value: Optional[str],
+    preferred_key: Optional[str] = None,
+) -> Optional[object]:
+    if not label_value:
+        return None
+    matches = find_custom_fields_by_label(nb, label_value)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -1010,32 +1194,6 @@ def find_custom_field_by_label(
             return preferred
         LOG.warning(
             "Multiple NetBox custom fields match label '%s'; skipping label match",
-            label_value,
-        )
-        return None
-
-    # Fallback: case-insensitive label scan (NetBox label filters may be case-sensitive).
-    try:
-        all_fields = list(nb.extras.custom_fields.filter())
-    except Exception as exc:
-        LOG.debug("Failed to list NetBox custom fields for label scan: %s", exc)
-        return None
-
-    target = label_value.strip().lower()
-    if not target:
-        return None
-
-    matches = [cf for cf in all_fields if str(getattr(cf, "label", "")).strip().lower() == target]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        preferred = select_custom_field_by_key(matches, preferred_key) or select_custom_field_by_key(
-            matches, label_value
-        )
-        if preferred:
-            return preferred
-        LOG.warning(
-            "Multiple NetBox custom fields match label '%s' (case-insensitive); skipping",
             label_value,
         )
         return None
@@ -1069,10 +1227,14 @@ def select_custom_field_by_key(candidates: List[object], preferred_key: Optional
 
 def set_custom_field_value(
     custom_fields_data: Dict[str, object],
-    spec: Optional[dict],
+    spec: Optional[object],
     value: Optional[object],
     include_if_none: bool = False,
 ) -> None:
+    if isinstance(spec, list):
+        for item in spec:
+            set_custom_field_value(custom_fields_data, item, value, include_if_none=include_if_none)
+        return
     if not spec:
         return
     if value is None and not include_if_none:
@@ -1985,6 +2147,65 @@ def resolve_boot_disk(pve_type: str, config: Optional[dict]) -> Optional[str]:
     return None
 
 
+def parse_disk_config_value(value: Optional[object]) -> Dict[str, Optional[str]]:
+    if not value or not isinstance(value, str):
+        return {"storage": None, "format": None, "volume": None}
+
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    main = parts[0] if parts else ""
+
+    for part in parts:
+        if part.startswith("file="):
+            main = part.split("=", 1)[1]
+            break
+        if part.startswith("volume="):
+            main = part.split("=", 1)[1]
+            break
+
+    storage = None
+    volume = None
+    if ":" in main:
+        storage, volume = main.split(":", 1)
+    elif main:
+        volume = main
+
+    fmt = None
+    for part in parts:
+        if part.startswith("format="):
+            fmt = part.split("=", 1)[1].strip()
+            break
+
+    if not fmt and volume:
+        ext = os.path.splitext(volume)[1].lower().lstrip(".")
+        if ext in ("qcow2", "raw", "vmdk", "vhdx", "img"):
+            fmt = ext
+
+    return {
+        "storage": normalize_text(storage),
+        "format": normalize_text(fmt),
+        "volume": normalize_text(volume),
+    }
+
+
+def resolve_boot_disk_details(
+    pve_type: str,
+    config: Optional[dict],
+    boot_disk: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if not boot_disk:
+        return None, None, None
+    config = config or {}
+
+    disk_value: Optional[object] = None
+    if pve_type == "qemu":
+        disk_value = config.get(boot_disk)
+    elif pve_type == "lxc":
+        disk_value = boot_disk
+
+    details = parse_disk_config_value(disk_value)
+    return details.get("storage"), details.get("format"), details.get("volume")
+
+
 def resolve_guest_agent_status(pve_type: str, config: Optional[dict]) -> Optional[str]:
     if pve_type != "qemu":
         return None
@@ -2005,11 +2226,45 @@ def resolve_qemu_numa_status(pve_type: str, config: Optional[dict]) -> Optional[
     return "enabled" if numa_enabled else "disabled"
 
 
-def resolve_qemu_machine_type(pve_type: str, config: Optional[dict]) -> Optional[str]:
+def resolve_qemu_bios_type(pve_type: str, config: Optional[dict], vm: Optional[dict]) -> Optional[str]:
     if pve_type != "qemu":
         return None
     config = config or {}
-    return normalize_text(config.get("machine"))
+    bios = normalize_text(config.get("bios") or (vm or {}).get("bios"))
+    if bios:
+        return bios
+    # Infer default if not explicitly set
+    for key in config.keys():
+        if str(key).lower().startswith("efidisk"):
+            return "ovmf"
+    return "seabios"
+
+
+def resolve_qemu_boot_order(pve_type: str, config: Optional[dict]) -> Optional[str]:
+    if pve_type != "qemu":
+        return None
+    config = config or {}
+    boot = normalize_text(config.get("boot"))
+    if not boot:
+        bootdisk = normalize_text(config.get("bootdisk"))
+        if bootdisk:
+            return bootdisk
+        return None
+    match = re.search(r"order=([^\\s]+)", boot)
+    if match:
+        return normalize_text(match.group(1))
+    return boot
+
+
+def resolve_qemu_machine_type(
+    pve_type: str,
+    config: Optional[dict],
+    vm: Optional[dict],
+) -> Optional[str]:
+    if pve_type != "qemu":
+        return None
+    config = config or {}
+    return normalize_text(config.get("machine") or (vm or {}).get("machine"))
 
 
 # ---------------------------------------------------------------------------
@@ -2338,7 +2593,7 @@ def sync_vms(
     site,
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
-    vm_cf_specs: Dict[str, Optional[dict]],
+    vm_cf_specs: Dict[str, Optional[List[dict]]],
     sync_timestamp: str,
 ) -> Tuple[Set[str], Set[int]]:
     """
@@ -2431,7 +2686,7 @@ def sync_single_vm(
     site,
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
-    vm_cf_specs: Dict[str, Optional[dict]],
+    vm_cf_specs: Dict[str, Optional[List[dict]]],
     sync_timestamp: str,
 ) -> Tuple[str, int]:
     """
@@ -2531,9 +2786,19 @@ def sync_single_vm(
     os_type = resolve_vm_os_type(vm, config)
     description = resolve_vm_description(vm, config)
     boot_disk = resolve_boot_disk(pve_type, config)
+    boot_disk_storage, boot_disk_format, _boot_volume = resolve_boot_disk_details(
+        pve_type, config, boot_disk
+    )
     guest_agent_status = resolve_guest_agent_status(pve_type, config)
     qemu_numa_status = resolve_qemu_numa_status(pve_type, config)
-    qemu_machine = resolve_qemu_machine_type(pve_type, config)
+    qemu_bios = resolve_qemu_bios_type(pve_type, config, vm)
+    qemu_boot_order = resolve_qemu_boot_order(pve_type, config)
+    qemu_machine = resolve_qemu_machine_type(pve_type, config, vm)
+    qemu_cpu_type = cpu_type if pve_type == "qemu" else None
+    qemu_cores_per_socket = cores if pve_type == "qemu" else None
+
+    memory_mb = bytes_to_mb(vm.get("maxmem", 0))
+    disk_mb = get_vm_disk_mb(proxmox, node_name, vmid, pve_type, vm, config=config)  # decimal MB
 
     pool_cf = vm_cf_specs.get("pool")
     gw4_cf = vm_cf_specs.get("gateway4")
@@ -2542,11 +2807,22 @@ def sync_single_vm(
     sockets_cf = vm_cf_specs.get("sockets")
     cores_cf = vm_cf_specs.get("cores")
     cpu_type_cf = vm_cf_specs.get("cpu_type")
+    qemu_cpu_type_cf = vm_cf_specs.get("qemu_cpu_type")
     os_type_cf = vm_cf_specs.get("os_type")
     description_cf = vm_cf_specs.get("description")
     boot_disk_cf = vm_cf_specs.get("boot_disk")
+    boot_disk_format_cf = vm_cf_specs.get("boot_disk_format")
+    boot_disk_storage_cf = vm_cf_specs.get("boot_disk_storage")
     guest_agent_cf = vm_cf_specs.get("guest_agent")
+    memory_cf = vm_cf_specs.get("memory_mb")
+    vm_node_cf = vm_cf_specs.get("vm_node")
+    vm_status_cf = vm_cf_specs.get("vm_status")
+    vm_tags_cf = vm_cf_specs.get("vm_tags")
+    cpu_sockets_cf = vm_cf_specs.get("cpu_sockets")
+    qemu_cores_per_socket_cf = vm_cf_specs.get("qemu_cores_per_socket")
     qemu_numa_cf = vm_cf_specs.get("qemu_numa")
+    qemu_bios_cf = vm_cf_specs.get("qemu_bios")
+    qemu_boot_order_cf = vm_cf_specs.get("qemu_boot_order")
     qemu_machine_cf = vm_cf_specs.get("qemu_machine")
     last_sync_cf = vm_cf_specs.get("last_sync")
 
@@ -2561,21 +2837,31 @@ def sync_single_vm(
 
     set_custom_field_value(custom_fields_data, vmid_cf, vmid)
     set_custom_field_value(custom_fields_data, sockets_cf, sockets)
+    set_custom_field_value(custom_fields_data, cpu_sockets_cf, sockets)
     set_custom_field_value(custom_fields_data, cores_cf, cores)
+    set_custom_field_value(custom_fields_data, qemu_cores_per_socket_cf, qemu_cores_per_socket)
     set_custom_field_value(custom_fields_data, cpu_type_cf, cpu_type)
+    set_custom_field_value(custom_fields_data, qemu_cpu_type_cf, qemu_cpu_type)
     set_custom_field_value(custom_fields_data, os_type_cf, os_type)
     set_custom_field_value(custom_fields_data, description_cf, description)
     set_custom_field_value(custom_fields_data, boot_disk_cf, boot_disk)
+    set_custom_field_value(custom_fields_data, boot_disk_format_cf, boot_disk_format)
+    set_custom_field_value(custom_fields_data, boot_disk_storage_cf, boot_disk_storage)
     set_custom_field_value(custom_fields_data, guest_agent_cf, guest_agent_status)
+    set_custom_field_value(custom_fields_data, memory_cf, memory_mb)
+    set_custom_field_value(custom_fields_data, vm_node_cf, node_name)
+    set_custom_field_value(custom_fields_data, vm_status_cf, pve_status)
+    if tags_known:
+        tags_value = ", ".join(tags) if tags else None
+        set_custom_field_value(custom_fields_data, vm_tags_cf, tags_value, include_if_none=True)
     set_custom_field_value(custom_fields_data, qemu_numa_cf, qemu_numa_status)
+    set_custom_field_value(custom_fields_data, qemu_bios_cf, qemu_bios)
+    set_custom_field_value(custom_fields_data, qemu_boot_order_cf, qemu_boot_order)
     set_custom_field_value(custom_fields_data, qemu_machine_cf, qemu_machine)
     set_custom_field_value(custom_fields_data, last_sync_cf, sync_timestamp)
 
     if not custom_fields_data:
         custom_fields_data = None
-
-    memory_mb = bytes_to_mb(vm.get("maxmem", 0))
-    disk_mb = get_vm_disk_mb(proxmox, node_name, vmid, pve_type, vm, config=config)  # decimal MB
 
     status_slug = map_vm_status(pve_status)
 

@@ -33,16 +33,27 @@ pip install proxmoxer pynetbox requests
   - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; auto-created and auto-attached to VMs if missing, requires NetBox custom field write permissions)
   - Optional VM gateway custom field keys: `NB_VM_GW4_CF` (defaults to `gateway4`), `NB_VM_GW6_CF` (defaults to `gateway6`). When enabled, the script stores gateway IPs from all LXC `netX` or QEMU cloud-init `ipconfigX` values; multiple gateways are stored as a comma-separated list. Set empty to disable. Requires NetBox custom field write permissions.
-  - Optional VM metadata custom field keys (auto-created/attached if missing; set empty to disable; requires NetBox custom field write permissions):
+  - Optional VM metadata custom field keys (auto-created/attached if missing; set empty to disable; requires NetBox custom field write permissions). If you have duplicate fields, you can set a comma-separated list of keys to populate them all.
     - `NB_VM_VMID_CF` (defaults to `vmid`)
     - `NB_VM_SOCKETS_CF` (defaults to `sockets`)
     - `NB_VM_CORES_CF` (defaults to `cores`)
     - `NB_VM_CPU_TYPE_CF` (defaults to `cpu_type`)
+    - `NB_VM_QEMU_CPU_TYPE_CF` (defaults to `qemu_cpu_type`)
     - `NB_VM_OS_TYPE_CF` (defaults to `os_type`)
     - `NB_VM_DESCRIPTION_CF` (defaults to `pve_description`)
     - `NB_VM_BOOT_DISK_CF` (defaults to `boot_disk`)
+    - `NB_VM_BOOT_DISK_FORMAT_CF` (defaults to `boot_disk_format`)
+    - `NB_VM_BOOT_DISK_STORAGE_CF` (defaults to `boot_disk_storage`)
     - `NB_VM_GUEST_AGENT_CF` (defaults to `guest_agent_status`, uses enabled/disabled from Proxmox config)
+    - `NB_VM_MEMORY_MB_CF` (defaults to `memory_mb`)
+    - `NB_VM_NODE_CF` (defaults to `vm_node`)
+    - `NB_VM_STATUS_CF` (defaults to `vm_status`)
+    - `NB_VM_TAGS_CF` (defaults to `vm_tags`)
+    - `NB_VM_CPU_SOCKETS_CF` (defaults to `cpu_sockets`)
+    - `NB_VM_QEMU_CORES_PER_SOCKET_CF` (defaults to `qemu_cores_per_socket`)
     - `NB_VM_QEMU_NUMA_CF` (defaults to `qemu_numa`, QEMU-only)
+    - `NB_VM_QEMU_BIOS_CF` (defaults to `qemu_bios`, QEMU-only)
+    - `NB_VM_QEMU_BOOT_ORDER_CF` (defaults to `qemu_boot_order`, QEMU-only)
     - `NB_VM_QEMU_MACHINE_CF` (defaults to `qemu_machine`, QEMU-only)
     - `NB_VM_LAST_SYNC_CF` (defaults to `last_sync`, timestamp)
     - `NB_VM_LAST_SYNC_TZ` (defaults to `+03:00`; set `local` to use system time)

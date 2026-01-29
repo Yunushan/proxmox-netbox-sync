@@ -30,15 +30,27 @@ export NB_VM_POOL_CF="pool"                  # Optional VM custom field key for 
 export NB_VM_GW4_CF="gateway4"               # Optional VM custom field key for IPv4 gateway (set empty to disable)
 export NB_VM_GW6_CF="gateway6"               # Optional VM custom field key for IPv6 gateway (set empty to disable)
 # Set any NB_VM_*_CF variable to empty to disable that field.
+# You can also provide a comma-separated list of keys to populate multiple fields.
 export NB_VM_VMID_CF="vmid"                  # Optional VM custom field key for VMID
 export NB_VM_SOCKETS_CF="sockets"            # Optional VM custom field key for CPU sockets
 export NB_VM_CORES_CF="cores"                # Optional VM custom field key for CPU cores per socket
 export NB_VM_CPU_TYPE_CF="cpu_type"          # Optional VM custom field key for CPU type
+export NB_VM_QEMU_CPU_TYPE_CF="qemu_cpu_type" # Optional VM custom field key for QEMU CPU type
 export NB_VM_OS_TYPE_CF="os_type"            # Optional VM custom field key for OS type
 export NB_VM_DESCRIPTION_CF="pve_description" # Optional VM custom field key for Proxmox description
 export NB_VM_BOOT_DISK_CF="boot_disk"        # Optional VM custom field key for boot disk
+export NB_VM_BOOT_DISK_FORMAT_CF="boot_disk_format" # Optional VM custom field key for boot disk format
+export NB_VM_BOOT_DISK_STORAGE_CF="boot_disk_storage" # Optional VM custom field key for boot disk storage
 export NB_VM_GUEST_AGENT_CF="guest_agent_status" # Optional VM custom field key for guest agent status
+export NB_VM_MEMORY_MB_CF="memory_mb"        # Optional VM custom field key for memory in MB
+export NB_VM_NODE_CF="vm_node"               # Optional VM custom field key for VM node
+export NB_VM_STATUS_CF="vm_status"           # Optional VM custom field key for VM status
+export NB_VM_TAGS_CF="vm_tags"               # Optional VM custom field key for VM tags (comma-separated)
+export NB_VM_CPU_SOCKETS_CF="cpu_sockets"     # Optional VM custom field key for CPU sockets
+export NB_VM_QEMU_CORES_PER_SOCKET_CF="qemu_cores_per_socket" # Optional VM custom field key for QEMU cores/socket
 export NB_VM_QEMU_NUMA_CF="qemu_numa"         # Optional VM custom field key for QEMU NUMA
+export NB_VM_QEMU_BIOS_CF="qemu_bios"         # Optional VM custom field key for QEMU BIOS type
+export NB_VM_QEMU_BOOT_ORDER_CF="qemu_boot_order" # Optional VM custom field key for QEMU boot order
 export NB_VM_QEMU_MACHINE_CF="qemu_machine"   # Optional VM custom field key for QEMU machine type
 export NB_VM_LAST_SYNC_CF="last_sync"         # Optional VM custom field key for last sync timestamp (UTC)
 export NB_VM_LAST_SYNC_TZ="+03:00"            # Offset for last sync timestamp; set "local" to use system time
