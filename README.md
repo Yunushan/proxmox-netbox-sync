@@ -96,7 +96,7 @@ python3 pve_to_netbox.py
 
 ## Run as a systemd service + timer
 
-`systemd/pve-netbox-sync.service` is a oneshot unit that sources your env file and runs the sync; `systemd/pve-netbox-sync.timer` schedules it (boot delay + every 5 minutes).
+`systemd/pve-netbox-sync.service` is a oneshot unit that sources your env file and runs the sync; `systemd/pve-netbox-sync.timer` schedules it (immediately after boot + every 12 hours).
 
 1. Place the project where the service will run, e.g. `/opt/proxmox-netbox-sync`, and create your `netbox_pve_env.sh` there.
 2. Adjust `systemd/pve-netbox-sync.service` so `WorkingDirectory` points to that path and `User` is the account that should run the sync. The `ExecStart` line assumes the virtualenv lives inside that directory (`venv/bin/python3`).

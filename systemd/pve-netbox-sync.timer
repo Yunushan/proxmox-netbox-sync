@@ -2,8 +2,8 @@
 Description=Run Proxmox -> NetBox sync periodically
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnBootSec=0min
+OnUnitActiveSec=12h
 Unit=pve-netbox-sync.service
 
 [Install]
