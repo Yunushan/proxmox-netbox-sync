@@ -2,7 +2,9 @@
 import os
 import logging
 import ipaddress
+import socket
 import re
+import json
 import base64
 import binascii
 import time
@@ -109,6 +111,189 @@ def resolve_node_host_details(node_name: str) -> Tuple[str, Optional[int]]:
     return node_name, base_port
 
 
+@lru_cache(maxsize=None)
+def resolve_node_ilo_details(node_name: str) -> Tuple[str, Optional[int]]:
+    node_map = parse_node_host_map(env(NODE_ILO_MAP_ENV))
+    if node_name in node_map:
+        return node_map[node_name]
+    node_key = (node_name or "").strip().lower()
+    if node_key in node_map:
+        return node_map[node_key]
+
+    npm_map = get_npm_ilo_host_map()
+    if node_name in npm_map:
+        return npm_map[node_name]
+    if node_key in npm_map:
+        return npm_map[node_key]
+
+    template = env(NODE_ILO_TEMPLATE_ENV)
+    if template:
+        host_value = template.format(node=node_name)
+        return split_host_port(host_value)
+
+    prefix_raw = env(NODE_ILO_PREFIX_ENV)
+    suffix_raw = env(NODE_ILO_SUFFIX_ENV)
+    if prefix_raw is not None or suffix_raw is not None:
+        prefix = "ilo-" if prefix_raw is None else (prefix_raw or "")
+        suffix = suffix_raw or ""
+        if prefix or suffix:
+            host_value = f"{prefix}{node_name}{suffix}"
+            return split_host_port(host_value)
+
+    for candidate in build_auto_node_ilo_candidates(node_name):
+        if resolve_host_primary_ip(candidate):
+            return candidate, None
+
+    return "", None
+
+
+def normalize_domain_suffix(value: Optional[str]) -> Optional[str]:
+    raw = (value or "").strip().strip(".").lower()
+    if not raw or "." not in raw:
+        return None
+    return raw
+
+
+def domain_suffix_from_host(value: Optional[str]) -> Optional[str]:
+    host, _ = split_host_port(value or "")
+    if not host:
+        return None
+
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+
+    if "." not in host:
+        return None
+    return normalize_domain_suffix(host.split(".", 1)[1])
+
+
+def parse_domain_suffix_list(raw_value: Optional[str]) -> List[str]:
+    if not raw_value:
+        return []
+    values: List[str] = []
+    for chunk in re.split(r"[,\s;]+", raw_value.strip()):
+        suffix = normalize_domain_suffix(chunk)
+        if suffix:
+            values.append(suffix)
+    return values
+
+
+@lru_cache(maxsize=1)
+def get_resolver_search_domains() -> List[str]:
+    paths = ["/etc/resolv.conf"]
+    domains: List[str] = []
+    seen: Set[str] = set()
+
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            tokens = line.split()
+            if len(tokens) < 2:
+                continue
+
+            keyword = tokens[0].lower()
+            if keyword not in ("search", "domain"):
+                continue
+
+            for token in tokens[1:]:
+                suffix = normalize_domain_suffix(token)
+                if not suffix or suffix in seen:
+                    continue
+                seen.add(suffix)
+                domains.append(suffix)
+
+    return domains
+
+
+@lru_cache(maxsize=1)
+def collect_auto_ilo_domain_suffixes() -> List[str]:
+    domains: List[str] = []
+    seen: Set[str] = set()
+
+    def add_suffix(value: Optional[str]) -> None:
+        suffix = normalize_domain_suffix(value)
+        if not suffix or suffix in seen:
+            return
+        seen.add(suffix)
+        domains.append(suffix)
+
+    for suffix in parse_domain_suffix_list(env(NODE_ILO_DOMAIN_SUFFIXES_ENV)):
+        add_suffix(suffix)
+
+    host_suffix = env("PVE_NODE_HOST_SUFFIX")
+    if host_suffix:
+        add_suffix(host_suffix.lstrip("."))
+
+    add_suffix(domain_suffix_from_host(env("PVE_HOST")))
+
+    host_map = parse_node_host_map(env("PVE_NODE_HOST_MAP"))
+    for host, _ in host_map.values():
+        add_suffix(domain_suffix_from_host(host))
+
+    host_template = env("PVE_NODE_HOST_TEMPLATE")
+    if host_template:
+        try:
+            sample = host_template.format(node="node")
+        except Exception:
+            sample = host_template
+        add_suffix(domain_suffix_from_host(sample))
+
+    fqdn = socket.getfqdn()
+    add_suffix(domain_suffix_from_host(fqdn))
+
+    for suffix in get_resolver_search_domains():
+        add_suffix(suffix)
+
+    return domains
+
+
+def build_auto_node_ilo_candidates(node_name: str) -> List[str]:
+    node = (node_name or "").strip().lower()
+    if not node:
+        return []
+
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def add_candidate(host: str) -> None:
+        candidate = (host or "").strip().lower()
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    base_node = node
+    node_domain = None
+    if "." in node:
+        base_node, node_domain = node.split(".", 1)
+        add_candidate(f"ilo-{node}")
+
+    if base_node:
+        if node_domain:
+            add_candidate(f"ilo-{base_node}.{node_domain}")
+
+        for suffix in collect_auto_ilo_domain_suffixes():
+            add_candidate(f"ilo-{base_node}.{suffix}")
+
+        add_candidate(f"ilo-{base_node}")
+
+    return candidates
+
+
 def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> None:
     if not env_file:
         return
@@ -142,6 +327,20 @@ def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> No
 
 SYNC_MODE_ENV = "PVE_NB_SYNC_MODE"
 GUEST_GW_FALLBACK_ENV = "PVE_GUEST_GW_FALLBACK"
+NODE_ILO_SYNC_ENV = "PVE_NODE_ILO_SYNC"
+NODE_ILO_MAP_ENV = "PVE_NODE_ILO_MAP"
+NODE_ILO_TEMPLATE_ENV = "PVE_NODE_ILO_TEMPLATE"
+NODE_ILO_PREFIX_ENV = "PVE_NODE_ILO_PREFIX"
+NODE_ILO_SUFFIX_ENV = "PVE_NODE_ILO_SUFFIX"
+NODE_ILO_INTERFACE_ENV = "PVE_NODE_ILO_INTERFACE"
+NODE_ILO_SET_PRIMARY_ENV = "PVE_NODE_ILO_SET_PRIMARY"
+NODE_ILO_NPM_URL_ENV = "PVE_NODE_ILO_NPM_URL"
+NODE_ILO_NPM_TOKEN_ENV = "PVE_NODE_ILO_NPM_TOKEN"
+NODE_ILO_NPM_USERNAME_ENV = "PVE_NODE_ILO_NPM_USERNAME"
+NODE_ILO_NPM_PASSWORD_ENV = "PVE_NODE_ILO_NPM_PASSWORD"
+NODE_ILO_NPM_VERIFY_SSL_ENV = "PVE_NODE_ILO_NPM_VERIFY_SSL"
+NODE_ILO_NPM_PREFIX_ENV = "PVE_NODE_ILO_NPM_PREFIX"
+NODE_ILO_DOMAIN_SUFFIXES_ENV = "PVE_NODE_ILO_DOMAIN_SUFFIXES"
 
 
 def parse_sync_mode(value: str) -> str:
@@ -373,6 +572,280 @@ def parse_bool(value: Optional[object]) -> Optional[bool]:
         return False
 
     return None
+
+
+def build_npm_api_base(url: str) -> str:
+    base = (url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/api"):
+        return base
+    return f"{base}/api"
+
+
+def parse_npm_domain_names(raw_value: Optional[object]) -> List[str]:
+    values: List[str] = []
+    if raw_value is None:
+        return values
+
+    if isinstance(raw_value, (list, tuple, set)):
+        values = [str(v).strip() for v in raw_value if v is not None and str(v).strip()]
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return []
+
+        parsed_json = None
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed_json = json.loads(text)
+            except ValueError:
+                parsed_json = None
+        if isinstance(parsed_json, list):
+            values = [str(v).strip() for v in parsed_json if v is not None and str(v).strip()]
+        else:
+            values = [chunk.strip() for chunk in re.split(r"[,\s]+", text) if chunk.strip()]
+    else:
+        values = [str(raw_value).strip()]
+
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for value in values:
+        clean = value.strip().strip(".").lower()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        normalized.append(clean)
+    return normalized
+
+
+def parse_node_from_ilo_domain(domain: str, prefix: str) -> Optional[str]:
+    clean = (domain or "").strip().strip(".").lower()
+    if not clean:
+        return None
+
+    first_label = clean.split(".", 1)[0]
+    pref = (prefix or "ilo-").strip().lower()
+    if not pref:
+        pref = "ilo-"
+    if not first_label.startswith(pref):
+        return None
+
+    node = first_label[len(pref) :].strip()
+    return node or None
+
+
+def parse_npm_proxy_hosts_response(payload: object) -> List[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        for key in ("data", "result", "results", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+    return []
+
+
+def extract_npm_token(payload: object) -> Optional[str]:
+    if isinstance(payload, str):
+        token = payload.strip()
+        return token or None
+
+    if isinstance(payload, dict):
+        for key in ("token", "access_token", "jwt"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("token", "access_token", "jwt"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    return None
+
+
+def rank_ilo_target(host: str, port: Optional[int]) -> Tuple[int, int]:
+    resolved = resolve_host_primary_ip(host) or host
+    scope_rank = 3
+    try:
+        addr = ipaddress.ip_address(resolved)
+        if addr.is_private:
+            scope_rank = 0
+        elif addr.is_loopback or addr.is_link_local:
+            scope_rank = 1
+        elif addr.is_global:
+            scope_rank = 2
+        else:
+            scope_rank = 3
+    except ValueError:
+        scope_rank = 3
+
+    port_rank = 0 if port is not None else 1
+    return scope_rank, port_rank
+
+
+def should_replace_ilo_target(
+    current: Tuple[str, Optional[int]],
+    candidate: Tuple[str, Optional[int]],
+) -> bool:
+    return rank_ilo_target(*candidate) < rank_ilo_target(*current)
+
+
+@lru_cache(maxsize=1)
+def get_npm_ilo_host_map() -> Dict[str, Tuple[str, Optional[int]]]:
+    url = env(NODE_ILO_NPM_URL_ENV)
+    if not url:
+        return {}
+
+    api_base = build_npm_api_base(url)
+    if not api_base:
+        return {}
+
+    verify = parse_bool(env(NODE_ILO_NPM_VERIFY_SSL_ENV, "false"))
+    if verify is None:
+        verify = False
+
+    prefix = (env(NODE_ILO_NPM_PREFIX_ENV, "ilo-") or "ilo-").strip().lower()
+    if not prefix:
+        prefix = "ilo-"
+
+    session = requests.Session()
+    session.verify = verify
+
+    token = env(NODE_ILO_NPM_TOKEN_ENV)
+    username = env(NODE_ILO_NPM_USERNAME_ENV)
+    password = env(NODE_ILO_NPM_PASSWORD_ENV)
+
+    if not token and username and password:
+        try:
+            response = session.post(
+                f"{api_base}/tokens",
+                json={"identity": username, "secret": password},
+                timeout=20,
+            )
+            response.raise_for_status()
+            token = extract_npm_token(response.json())
+        except Exception as exc:
+            LOG.warning("Failed to authenticate to NPM API at %s: %s", api_base, exc)
+            token = None
+
+    if token:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+
+    hosts: List[dict] = []
+    try:
+        response = session.get(f"{api_base}/nginx/proxy-hosts", timeout=30)
+        response.raise_for_status()
+        hosts = parse_npm_proxy_hosts_response(response.json())
+    except Exception as exc:
+        LOG.warning("Failed to read NPM proxy hosts from %s: %s", api_base, exc)
+        return {}
+
+    mapping: Dict[str, Tuple[str, Optional[int]]] = {}
+    for host_data in hosts:
+        forward_host_raw = (
+            host_data.get("forward_host")
+            or host_data.get("forward_hostname")
+            or host_data.get("forward_domain")
+        )
+        if not forward_host_raw:
+            continue
+
+        forward_host, inline_port = split_host_port(str(forward_host_raw))
+        if not forward_host:
+            continue
+
+        forward_port = parse_int(host_data.get("forward_port"))
+        if forward_port is None:
+            forward_port = inline_port
+
+        domain_names = parse_npm_domain_names(
+            host_data.get("domain_names")
+            or host_data.get("domain_name")
+            or host_data.get("domain")
+        )
+        if not domain_names:
+            continue
+
+        for domain in domain_names:
+            node_key = parse_node_from_ilo_domain(domain, prefix)
+            if not node_key:
+                continue
+            candidate = (forward_host, forward_port)
+            current = mapping.get(node_key)
+            if not current or should_replace_ilo_target(current, candidate):
+                mapping[node_key] = candidate
+
+    if mapping:
+        LOG.info("Loaded %d iLO mappings from NPM proxy hosts", len(mapping))
+
+    return mapping
+
+
+def should_sync_node_ilo() -> bool:
+    explicit = parse_bool(env(NODE_ILO_SYNC_ENV))
+    if explicit is not None:
+        return explicit
+
+    return True
+
+
+def has_explicit_node_ilo_mapping() -> bool:
+    return any(
+        env(var)
+        for var in (
+            NODE_ILO_MAP_ENV,
+            NODE_ILO_TEMPLATE_ENV,
+            NODE_ILO_PREFIX_ENV,
+            NODE_ILO_SUFFIX_ENV,
+            NODE_ILO_NPM_URL_ENV,
+            NODE_ILO_DOMAIN_SUFFIXES_ENV,
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def resolve_host_primary_ip(host: str) -> Optional[str]:
+    host = (host or "").strip()
+    if not host:
+        return None
+
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    try:
+        addr_infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        LOG.debug("Unable to resolve iLO host '%s': %s", host, exc)
+        return None
+    except Exception as exc:
+        LOG.debug("Unexpected resolver failure for iLO host '%s': %s", host, exc)
+        return None
+
+    candidates: List[str] = []
+    seen: Set[str] = set()
+    for _, _, _, _, sockaddr in addr_infos:
+        ip_value = sockaddr[0]
+        if ip_value in seen:
+            continue
+        seen.add(ip_value)
+        candidates.append(ip_value)
+
+    if not candidates:
+        return None
+
+    for candidate in candidates:
+        if ":" not in candidate:
+            return candidate
+    return candidates[0]
 
 
 def normalize_text(value: Optional[object]) -> Optional[str]:
@@ -2545,6 +3018,217 @@ def ensure_node_devices(
     return node_devices
 
 
+def ensure_node_ilo_interface(nb, device, iface_name: str):
+    iface = nb.dcim.interfaces.get(device_id=device.id, name=iface_name)
+    if iface:
+        return iface
+
+    LOG.info("Creating NetBox device interface %s on node %s", iface_name, device.name)
+    payloads = [
+        {
+            "name": iface_name,
+            "device": device.id,
+            "type": "virtual",
+            "enabled": True,
+            "mgmt_only": True,
+        },
+        {
+            "name": iface_name,
+            "device": device.id,
+            "type": "other",
+            "enabled": True,
+            "mgmt_only": True,
+        },
+        {
+            "name": iface_name,
+            "device": device.id,
+            "type": "virtual",
+            "enabled": True,
+        },
+        {
+            "name": iface_name,
+            "device": device.id,
+            "enabled": True,
+        },
+    ]
+
+    last_exc: Optional[Exception] = None
+    for payload in payloads:
+        try:
+            return nb.dcim.interfaces.create(payload)
+        except RequestError as exc:
+            last_exc = exc
+            LOG.debug(
+                "Failed to create iLO interface %s on %s with payload keys=%s: %s",
+                iface_name,
+                device.name,
+                ",".join(payload.keys()),
+                exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            LOG.debug(
+                "Unexpected failure while creating iLO interface %s on %s: %s",
+                iface_name,
+                device.name,
+                exc,
+            )
+
+    iface = nb.dcim.interfaces.get(device_id=device.id, name=iface_name)
+    if iface:
+        return iface
+
+    if last_exc:
+        raise last_exc
+    return None
+
+
+def ensure_node_ilo_ip_address(nb, iface, cidr: str):
+    ip = cidr.split("/", 1)[0]
+    candidates = list(nb.ipam.ip_addresses.filter(address=cidr))
+
+    ip_obj = next(
+        (
+            c
+            for c in candidates
+            if getattr(c, "assigned_object_type", None) == "dcim.interface"
+            and getattr(c, "assigned_object_id", None) == iface.id
+        ),
+        None,
+    )
+    if not ip_obj and candidates:
+        ip_obj = next((c for c in candidates if not getattr(c, "assigned_object_id", None)), None)
+    if not ip_obj and candidates:
+        ip_obj = candidates[0]
+
+    if not ip_obj:
+        host_candidates = list(nb.ipam.ip_addresses.filter(q=ip))
+        same_host = [c for c in host_candidates if str(getattr(c, "address", "")).split("/")[0] == ip]
+        ip_obj = next(
+            (
+                c
+                for c in same_host
+                if getattr(c, "assigned_object_type", None) == "dcim.interface"
+                and getattr(c, "assigned_object_id", None) == iface.id
+            ),
+            None,
+        )
+        if not ip_obj and same_host:
+            ip_obj = next((c for c in same_host if not getattr(c, "assigned_object_id", None)), None)
+        if not ip_obj and same_host:
+            ip_obj = same_host[0]
+
+    if not ip_obj:
+        return nb.ipam.ip_addresses.create(
+            {
+                "address": cidr,
+                "status": "active",
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": iface.id,
+            }
+        )
+
+    ao_type = getattr(ip_obj, "assigned_object_type", None)
+    ao_id = getattr(ip_obj, "assigned_object_id", None)
+    if ao_type == "dcim.interface" and ao_id == iface.id:
+        return ip_obj
+
+    if ao_type and ao_id:
+        LOG.warning(
+            "IP %s already assigned to %s (id=%s); leaving existing assignment untouched",
+            cidr,
+            ao_type,
+            ao_id,
+        )
+        return None
+
+    ip_obj.status = "active"
+    ip_obj.assigned_object_type = "dcim.interface"
+    ip_obj.assigned_object_id = iface.id
+    ip_obj.save()
+    return ip_obj
+
+
+def sync_node_ilo_addresses(nb, node_devices: Dict[str, Optional[object]]) -> None:
+    if not should_sync_node_ilo():
+        return
+
+    interface_name = (env(NODE_ILO_INTERFACE_ENV, "iLO") or "iLO").strip() or "iLO"
+    set_primary = parse_bool(env(NODE_ILO_SET_PRIMARY_ENV, "true"))
+    explicit_mapping = has_explicit_node_ilo_mapping()
+    if set_primary is None:
+        set_primary = True
+
+    LOG.info("Syncing node iLO addresses (interface=%s)", interface_name)
+
+    for node_name, device in sorted(node_devices.items(), key=lambda item: item[0]):
+        if not device:
+            LOG.warning("Skipping iLO sync for node %s: no matching NetBox device", node_name)
+            continue
+
+        host, port = resolve_node_ilo_details(node_name)
+        if not host:
+            if explicit_mapping:
+                LOG.warning("Skipping iLO sync for node %s: unable to derive iLO host", node_name)
+            else:
+                LOG.info("Skipping iLO sync for node %s: no resolvable iLO host found", node_name)
+            continue
+
+        ip = resolve_host_primary_ip(host)
+        if not ip:
+            LOG.warning(
+                "Skipping iLO sync for node %s: unable to resolve host '%s'",
+                node_name,
+                host,
+            )
+            continue
+
+        prefix = 128 if ":" in ip else 32
+        cidr = f"{ip}/{prefix}"
+
+        try:
+            iface = ensure_node_ilo_interface(nb, device, interface_name)
+            if not iface:
+                LOG.warning(
+                    "Skipping iLO IP assignment for node %s: failed to get interface %s",
+                    node_name,
+                    interface_name,
+                )
+                continue
+
+            ip_obj = ensure_node_ilo_ip_address(nb, iface, cidr)
+        except RequestError as exc:
+            LOG.error("Failed iLO sync for node %s (%s): %s", node_name, cidr, exc)
+            continue
+        except Exception as exc:
+            LOG.error("Unexpected iLO sync failure for node %s (%s): %s", node_name, cidr, exc)
+            continue
+
+        if not ip_obj:
+            continue
+
+        endpoint = f"{host}:{port}" if port else host
+        LOG.info("Node %s iLO endpoint %s resolved to %s", node_name, endpoint, cidr)
+
+        if not set_primary:
+            continue
+
+        need_save = False
+        if ":" in ip:
+            current_v6 = getattr(getattr(device, "primary_ip6", None), "id", None)
+            if current_v6 != ip_obj.id:
+                device.primary_ip6 = ip_obj
+                need_save = True
+        else:
+            current_v4 = getattr(getattr(device, "primary_ip4", None), "id", None)
+            if current_v4 != ip_obj.id:
+                device.primary_ip4 = ip_obj
+                need_save = True
+
+        if need_save:
+            device.save()
+
+
 # ---------------------------------------------------------------------------
 # VM interface + IP sync
 # ---------------------------------------------------------------------------
@@ -3230,6 +3914,7 @@ def main():
 
     vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
+    sync_node_ilo_addresses(nb, node_devices)
     synced_vm_names, synced_vm_ids = sync_vms(
         nb,
         proxmox,

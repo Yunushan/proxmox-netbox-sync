@@ -60,6 +60,19 @@ pip install proxmoxer pynetbox requests
   - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
   - Optional guest gateway fallback: `PVE_GUEST_GW_FALLBACK` (defaults to `true`). When enabled, QEMU guests with `qemu-guest-agent` will be queried for default routes via guest exec to populate gateways set inside the VM OS.
   - Optional env file auto-update path: `PVE_ENV_FILE` (defaults to `netbox_pve_env.sh`). If `PVE_GUEST_GW_FALLBACK` is missing and the env file exists, the script appends it.
+  - Optional node iLO/OOB sync:
+    - `PVE_NODE_ILO_SYNC` (optional bool; defaults to enabled, set `false` to disable)
+    - `PVE_NODE_ILO_MAP` (e.g. `node-a=192.0.2.10:443,node-b=198.51.100.20:443`)
+    - `PVE_NODE_ILO_TEMPLATE` (e.g. `mgmt-{node}.example.net:443`)
+    - `PVE_NODE_ILO_PREFIX` / `PVE_NODE_ILO_SUFFIX` (fallback host pattern, e.g. `mgmt-` + `{node}` + `.example.net:443`)
+    - Optional NPM auto-discovery for `ilo-*` hostnames (reads proxy destinations):
+      - `PVE_NODE_ILO_NPM_URL` (NPM base URL)
+      - `PVE_NODE_ILO_NPM_TOKEN` (preferred) or `PVE_NODE_ILO_NPM_USERNAME` + `PVE_NODE_ILO_NPM_PASSWORD`
+      - `PVE_NODE_ILO_NPM_VERIFY_SSL` (defaults to `false`)
+      - `PVE_NODE_ILO_NPM_PREFIX` (defaults to `ilo-`)
+    - `PVE_NODE_ILO_DOMAIN_SUFFIXES` (optional comma/space list of extra DNS suffixes for auto `ilo-{node}` lookup; e.g. `example.com example.net example.org`)
+    - `PVE_NODE_ILO_INTERFACE` (defaults to `iLO`)
+    - `PVE_NODE_ILO_SET_PRIMARY` (defaults to `true`; updates device primary IP from iLO IP)
 
 ### Sync modes
 
@@ -71,7 +84,7 @@ pip install proxmoxer pynetbox requests
 - **NetBox API token** (user or token-scoped permissions):
   - Virtualization: read/write `clusters`, `virtual-machines`, `interfaces`.
   - IPAM: read/write `ip-addresses`, `vlans`.
-  - DCIM: read/write `sites`, `devices`, `device-roles`, `device-types`.
+  - DCIM: read/write `sites`, `devices`, `interfaces`, `device-roles`, `device-types`.
   - If you prefer read-only sites/roles/types, grant read on those and write on the objects the tool creates/updates (VMs, interfaces, IPs, VLANs, devices).
 
 - **Proxmox API user/token** (recommended: dedicated service account with a custom role):
@@ -82,6 +95,11 @@ pip install proxmoxer pynetbox requests
 - **Per-node API host selection** (guest exec compatibility on mixed versions):
   - By default, the script derives per-node API hosts from `PVE_HOST` (e.g. `pve1.example.com` -> `pve2.example.com`).
   - Override with `PVE_NODE_HOST_SUFFIX`, `PVE_NODE_HOST_TEMPLATE`, or `PVE_NODE_HOST_MAP` when node names do not resolve via DNS.
+
+- **Node iLO/OOB IP sync**:
+  - Enabled by default. The script resolves one iLO/OOB address per Proxmox node, creates/uses a NetBox device interface (default name `iLO`), assigns the IP to that interface, and optionally sets `primary_ip4` / `primary_ip6`.
+  - Host resolution order: `PVE_NODE_ILO_MAP` -> NPM `ilo-*` discovery (`PVE_NODE_ILO_NPM_*`) -> `PVE_NODE_ILO_TEMPLATE` -> `PVE_NODE_ILO_PREFIX` + `{node}` + `PVE_NODE_ILO_SUFFIX` -> automatic DNS discovery across multiple domain suffixes (`ilo-{node}.<suffix>` from resolver search domains, `PVE_HOST`/node host settings, and `PVE_NODE_ILO_DOMAIN_SUFFIXES`) -> `ilo-{node}`.
+  - Hostnames are DNS-resolved and stored as `/32` (IPv4) or `/128` (IPv6) IP addresses.
 
 - **Proxmox guest agent inside VMs**:
   - Install and enable `qemu-guest-agent` so IP discovery works. Without it, VMs are still synced but IPs remain empty.

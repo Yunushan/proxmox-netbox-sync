@@ -9,6 +9,20 @@ export PVE_VERIFY_SSL="false"         # Set true to verify TLS certs
 export PVE_NODE_HOST_SUFFIX=""        # Optional suffix for per-node API host (e.g. ".example.com")
 export PVE_NODE_HOST_TEMPLATE=""      # Optional template (e.g. "{node}.example.com")
 export PVE_NODE_HOST_MAP=""           # Optional map (e.g. "pve1=10.0.0.1,pve2=10.0.0.2")
+export PVE_NODE_ILO_SYNC=""           # Optional bool. Default is enabled; set false to disable iLO sync.
+export PVE_NODE_ILO_MAP=""            # Optional map override (e.g. "node-a=192.0.2.10:443,node-b=198.51.100.20:443")
+export PVE_NODE_ILO_TEMPLATE=""       # Optional template override (e.g. "mgmt-{node}.example.net:443")
+export PVE_NODE_ILO_PREFIX=""         # Optional fallback prefix (e.g. "mgmt-")
+export PVE_NODE_ILO_SUFFIX=""         # Optional fallback suffix (e.g. ".example.net:443")
+export PVE_NODE_ILO_NPM_URL=""        # Optional NPM base URL (e.g. "https://npm.example.net")
+export PVE_NODE_ILO_NPM_TOKEN=""      # Optional NPM API token (preferred)
+export PVE_NODE_ILO_NPM_USERNAME=""   # Optional NPM username/email (used when token is empty)
+export PVE_NODE_ILO_NPM_PASSWORD=""   # Optional NPM password (used with username)
+export PVE_NODE_ILO_NPM_VERIFY_SSL="false" # Verify NPM TLS certificate
+export PVE_NODE_ILO_NPM_PREFIX="ilo-" # Match NPM proxy hostnames by prefix (e.g. "ilo-node1.example.net")
+export PVE_NODE_ILO_DOMAIN_SUFFIXES="" # Optional extra DNS suffixes (comma/space; e.g. "example.com example.net example.org")
+export PVE_NODE_ILO_INTERFACE="iLO"   # Optional NetBox interface name for node management IP
+export PVE_NODE_ILO_SET_PRIMARY="true" # Set node primary_ip4/primary_ip6 from resolved iLO IP
 
 # Netbox
 export NB_URL="https://netbox.example.com"   # NetBox base URL
