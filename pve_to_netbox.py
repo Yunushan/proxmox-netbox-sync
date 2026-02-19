@@ -574,6 +574,60 @@ def parse_bool(value: Optional[object]) -> Optional[bool]:
     return None
 
 
+def request_error_status_code(exc: RequestError) -> Optional[int]:
+    req = getattr(exc, "req", None)
+    status = getattr(req, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+
+    match = re.search(r"\bcode\s+(\d{3})\b", str(exc))
+    if match:
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def is_retryable_netbox_error(exc: RequestError) -> bool:
+    status = request_error_status_code(exc)
+    return bool(status and 500 <= status < 600)
+
+
+def save_netbox_object_with_retry(obj, context: str, max_attempts: int = 3) -> None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            obj.save()
+            return
+        except RequestError as exc:
+            if not is_retryable_netbox_error(exc):
+                raise
+
+            status = request_error_status_code(exc) or "5xx"
+            if attempt >= max_attempts:
+                LOG.error(
+                    "NetBox returned %s while %s after %d attempts",
+                    status,
+                    context,
+                    max_attempts,
+                )
+                raise
+
+            delay_s = min(5.0, 1.5 * attempt)
+            LOG.warning(
+                "NetBox returned %s while %s (attempt %d/%d); retrying in %.1fs",
+                status,
+                context,
+                attempt,
+                max_attempts,
+                delay_s,
+            )
+            time.sleep(delay_s)
+
+
 def build_npm_api_base(url: str) -> str:
     base = (url or "").strip().rstrip("/")
     if not base:
@@ -3382,7 +3436,7 @@ def ensure_vm_interface_and_ips(
             try:
                 candidates = list(nb.ipam.ip_addresses.filter(q=ip))
             except RequestError as exc:
-                status = getattr(getattr(exc, "req", None), "status_code", None)
+                status = request_error_status_code(exc)
                 if status and 500 <= status < 600:
                     LOG.warning(
                         "NetBox returned %s while searching for IP host %s; skipping host match",
@@ -3418,7 +3472,7 @@ def ensure_vm_interface_and_ips(
                         cidr,
                     )
                     continue
-                status = getattr(getattr(exc, "req", None), "status_code", None)
+                status = request_error_status_code(exc)
                 if status and 500 <= status < 600:
                     LOG.warning(
                         "NetBox returned %s while creating IP %s; skipping this IP and continuing",
@@ -3462,7 +3516,7 @@ def ensure_vm_interface_and_ips(
         nb_vm.primary_ip6 = primary_v6
         need_save = True
     if need_save:
-        nb_vm.save()
+        save_netbox_object_with_retry(nb_vm, f"updating primary IPs on VM {nb_vm.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -3517,43 +3571,51 @@ def sync_vms(
             node_name, len(qemus), len(lxcs)
         )
 
-        for vm in qemus:
+        def sync_and_track_vm(vm: dict, vm_kind: str) -> None:
+            nonlocal total_vms
             total_vms += 1
-            name, vmid = sync_single_vm(
-                nb=nb,
-                proxmox=proxmox,
-                vm=vm,
-                node_name=node_name,
-                host_device=host_device,
-                cluster=cluster,
-                pve_type="qemu",
-                site=site,
-                vmid_map=vmid_map,
-                vm_resource_map=vm_resource_map,
-                vm_cf_specs=vm_cf_specs,
-                sync_timestamp=sync_timestamp,
-            )
+
+            vmid = vm.get("vmid")
+            vm_name = vm.get("name") or f"vm-{vmid}"
+
+            try:
+                name, synced_vmid = sync_single_vm(
+                    nb=nb,
+                    proxmox=proxmox,
+                    vm=vm,
+                    node_name=node_name,
+                    host_device=host_device,
+                    cluster=cluster,
+                    pve_type=vm_kind,
+                    site=site,
+                    vmid_map=vmid_map,
+                    vm_resource_map=vm_resource_map,
+                    vm_cf_specs=vm_cf_specs,
+                    sync_timestamp=sync_timestamp,
+                )
+            except RequestError as exc:
+                status = request_error_status_code(exc)
+                if status and 500 <= status < 600:
+                    LOG.error(
+                        "Skipping VM %s (vmid=%s, node=%s, type=%s): transient NetBox API error %s: %s",
+                        vm_name,
+                        vmid,
+                        node_name,
+                        vm_kind,
+                        status,
+                        exc,
+                    )
+                    return
+                raise
+
             synced_vm_names.add(name)
-            synced_vm_ids.add(vmid)
+            synced_vm_ids.add(synced_vmid)
+
+        for vm in qemus:
+            sync_and_track_vm(vm, "qemu")
 
         for vm in lxcs:
-            total_vms += 1
-            name, vmid = sync_single_vm(
-                nb=nb,
-                proxmox=proxmox,
-                vm=vm,
-                node_name=node_name,
-                host_device=host_device,
-                cluster=cluster,
-                pve_type="lxc",
-                site=site,
-                vmid_map=vmid_map,
-                vm_resource_map=vm_resource_map,
-                vm_cf_specs=vm_cf_specs,
-                sync_timestamp=sync_timestamp,
-            )
-            synced_vm_names.add(name)
-            synced_vm_ids.add(vmid)
+            sync_and_track_vm(vm, "lxc")
 
     LOG.info("Total Proxmox guests synced (QEMU + LXC): %d", total_vms)
     return synced_vm_names, synced_vm_ids
@@ -3826,7 +3888,7 @@ def sync_single_vm(
         if target_disk_mb and (nb_vm.disk or 0) != target_disk_mb:
             nb_vm.disk = target_disk_mb
 
-        nb_vm.save()
+        save_netbox_object_with_retry(nb_vm, f"updating NetBox VM {name}")
 
     # Interface + IP handling
     ensure_vm_interface_and_ips(
