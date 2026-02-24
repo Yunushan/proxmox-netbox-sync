@@ -1860,70 +1860,122 @@ def ensure_vm_interface_mac(nb, iface, mac: Optional[str]) -> bool:
         return False
 
     iface_label = f"{getattr(iface, 'name', '?')} (id={getattr(iface, 'id', '?')})"
+    mac_endpoint = getattr(getattr(nb, "dcim", None), "mac_addresses", None)
+    if mac_endpoint is not None:
+        mac_obj = None
+
+        # First try: look for an already assigned MAC on this interface.
+        try:
+            iface_macs = list(
+                mac_endpoint.filter(
+                    assigned_object_type="virtualization.vminterface",
+                    assigned_object_id=iface.id,
+                )
+            )
+        except Exception as exc:
+            LOG.debug("Failed to query MACs assigned to VM interface %s: %s", iface_label, exc)
+            iface_macs = []
+
+        for candidate in iface_macs:
+            candidate_mac = normalize_mac_address(getattr(candidate, "mac_address", None))
+            if candidate_mac == target_mac:
+                mac_obj = candidate
+                break
+
+        # Second try: look up the MAC by value (for existing objects created previously).
+        global_mac_matches = []
+        if mac_obj is None:
+            try:
+                global_mac_matches = list(mac_endpoint.filter(mac_address=target_mac))
+            except Exception as exc:
+                LOG.debug("Failed to query MAC %s by value: %s", target_mac, exc)
+
+            for candidate in global_mac_matches:
+                assigned_type = getattr(candidate, "assigned_object_type", None)
+                assigned_id = get_related_object_id(getattr(candidate, "assigned_object_id", None))
+                if assigned_type == "virtualization.vminterface" and assigned_id == iface.id:
+                    mac_obj = candidate
+                    break
+
+        if mac_obj is None:
+            # Reuse an unassigned matching MAC object if available.
+            for candidate in global_mac_matches:
+                assigned_type = getattr(candidate, "assigned_object_type", None)
+                assigned_id = get_related_object_id(getattr(candidate, "assigned_object_id", None))
+                if not assigned_type and not assigned_id:
+                    mac_obj = candidate
+                    break
+
+        if mac_obj is None:
+            try:
+                mac_obj = mac_endpoint.create(
+                    {
+                        "mac_address": target_mac,
+                        "assigned_object_type": "virtualization.vminterface",
+                        "assigned_object_id": iface.id,
+                    }
+                )
+            except Exception as exc:
+                LOG.warning("Failed to create MAC %s for VM interface %s: %s", target_mac, iface_label, exc)
+                return False
+        else:
+            assigned_type = getattr(mac_obj, "assigned_object_type", None)
+            assigned_id = get_related_object_id(getattr(mac_obj, "assigned_object_id", None))
+            if assigned_type != "virtualization.vminterface" or assigned_id != iface.id:
+                try:
+                    mac_obj.assigned_object_type = "virtualization.vminterface"
+                    mac_obj.assigned_object_id = iface.id
+                    save_netbox_object_with_retry(
+                        mac_obj,
+                        f"assigning MAC {target_mac} to VM interface {iface_label}",
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to assign existing MAC %s to VM interface %s: %s",
+                        target_mac,
+                        iface_label,
+                        exc,
+                    )
+                    return False
+
+        mac_id = get_related_object_id(mac_obj)
+        if mac_id and hasattr(iface, "primary_mac_address"):
+            current_primary_id = get_related_object_id(getattr(iface, "primary_mac_address", None))
+            if current_primary_id != mac_id:
+                last_exc = None
+                for candidate in (mac_id, {"id": mac_id}):
+                    try:
+                        iface.primary_mac_address = candidate
+                        save_netbox_object_with_retry(
+                            iface,
+                            f"setting primary MAC on VM interface {iface_label}",
+                        )
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                if last_exc is not None:
+                    LOG.warning(
+                        "Failed to set primary MAC %s on VM interface %s: %s",
+                        target_mac,
+                        iface_label,
+                        last_exc,
+                    )
+                    return False
+
+        return True
+
+    # NetBox <4 compatibility path where interface has a direct mac_address field.
     current_mac = normalize_mac_address(getattr(iface, "mac_address", None))
     if current_mac == target_mac:
         return False
-
-    # NetBox <4 compatibility path where interface has a direct mac_address field.
     try:
         iface.mac_address = target_mac
         save_netbox_object_with_retry(iface, f"updating MAC on VM interface {iface_label}")
         return True
     except Exception as exc:
-        LOG.debug(
-            "Direct mac_address update failed for VM interface %s; trying dcim.mac-addresses fallback: %s",
-            iface_label,
-            exc,
-        )
-
-    mac_endpoint = getattr(getattr(nb, "dcim", None), "mac_addresses", None)
-    if mac_endpoint is None:
-        LOG.warning("Unable to set MAC %s on VM interface %s", target_mac, iface_label)
+        LOG.warning("Unable to set MAC %s on VM interface %s: %s", target_mac, iface_label, exc)
         return False
-
-    mac_obj = None
-    try:
-        existing = list(
-            mac_endpoint.filter(
-                assigned_object_type="virtualization.vminterface",
-                assigned_object_id=iface.id,
-            )
-        )
-    except Exception as exc:
-        LOG.warning("Failed to query existing MAC objects for VM interface %s: %s", iface_label, exc)
-        existing = []
-
-    for candidate in existing:
-        candidate_mac = normalize_mac_address(getattr(candidate, "mac_address", None))
-        if candidate_mac == target_mac:
-            mac_obj = candidate
-            break
-
-    if mac_obj is None:
-        try:
-            mac_obj = mac_endpoint.create(
-                {
-                    "mac_address": target_mac,
-                    "assigned_object_type": "virtualization.vminterface",
-                    "assigned_object_id": iface.id,
-                }
-            )
-        except Exception as exc:
-            LOG.warning("Failed to create MAC %s for VM interface %s: %s", target_mac, iface_label, exc)
-            return False
-
-    mac_id = get_related_object_id(mac_obj)
-    if mac_id and hasattr(iface, "primary_mac_address"):
-        try:
-            iface.primary_mac_address = mac_id
-            save_netbox_object_with_retry(
-                iface,
-                f"setting primary MAC on VM interface {iface_label}",
-            )
-        except Exception as exc:
-            LOG.debug("Failed to set primary MAC on VM interface %s: %s", iface_label, exc)
-
-    return True
 
 
 def parse_vm_nic_config(net_value: Optional[object], nic_name: str = "net0") -> Dict[str, Optional[object]]:
@@ -3513,30 +3565,11 @@ def ensure_vm_interface_and_ips(
                 "virtual_machine": nb_vm.id,
                 "enabled": True,
             }
-            if mac:
-                payload["mac_address"] = mac
             if vlan_obj:
                 payload["mode"] = "access"
                 payload["untagged_vlan"] = vlan_obj.id
 
-            try:
-                iface = nb.virtualization.interfaces.create(payload)
-            except RequestError as exc:
-                err_text = str(getattr(exc, "error", exc)).lower()
-                if mac and (
-                    "mac_address" in err_text
-                    or "primary_mac_address" in err_text
-                    or "mac address" in err_text
-                ):
-                    LOG.debug(
-                        "Retrying VM interface create for %s on %s without mac_address due to API validation",
-                        iface_name,
-                        nb_vm.name,
-                    )
-                    payload.pop("mac_address", None)
-                    iface = nb.virtualization.interfaces.create(payload)
-                else:
-                    raise
+            iface = nb.virtualization.interfaces.create(payload)
         else:
             changed = False
             if vlan_obj:
@@ -3555,7 +3588,14 @@ def ensure_vm_interface_and_ips(
                 )
 
         if iface and mac:
-            ensure_vm_interface_mac(nb, iface, mac)
+            mac_synced = ensure_vm_interface_mac(nb, iface, mac)
+            if not mac_synced:
+                LOG.warning(
+                    "MAC sync failed for VM interface %s on VM %s (target MAC %s)",
+                    iface_name,
+                    nb_vm.name,
+                    mac,
+                )
 
         if iface and primary_iface is None:
             primary_iface = iface
