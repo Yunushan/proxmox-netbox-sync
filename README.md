@@ -60,6 +60,10 @@ pip install proxmoxer pynetbox requests
   - Optional sync mode: `PVE_NB_SYNC_MODE` (`1`/`safe` = no deletions; `2`/`full` = delete NetBox VMs missing in Proxmox). If unset, the script prompts on startup (Enter defaults to safe).
   - Optional guest gateway fallback: `PVE_GUEST_GW_FALLBACK` (defaults to `true`). When enabled, QEMU guests with `qemu-guest-agent` will be queried for default routes via guest exec to populate gateways set inside the VM OS.
   - Optional env file auto-update path: `PVE_ENV_FILE` (defaults to `netbox_pve_env.sh`). If `PVE_GUEST_GW_FALLBACK` is missing and the env file exists, the script appends it.
+  - Optional IP block report:
+    - `PVE_NB_IP_BLOCK_REPORT` (optional bool; defaults to `false`). Set `true` to log prefix utilization after sync.
+    - `PVE_NB_IP_BLOCK_REPORT_PATH` (optional file path). If set, writes the same prefix report to CSV.
+    - Report scope follows `NB_SITE_SLUG` when set; otherwise all NetBox prefixes are included.
   - Optional node iLO/OOB sync:
     - `PVE_NODE_ILO_SYNC` (optional bool; defaults to enabled, set `false` to disable)
     - `PVE_NODE_ILO_MAP` (e.g. `node-a=192.0.2.10:443,node-b=198.51.100.20:443`)

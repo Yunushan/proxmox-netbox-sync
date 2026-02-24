@@ -34,6 +34,8 @@ export NB_VERIFY_SSL="false"                 # Set true to verify TLS certs
 export PVE_NB_SYNC_MODE=""
 export PVE_ENV_FILE="netbox_pve_env.sh"     # Optional path for auto-updating env file defaults
 export PVE_GUEST_GW_FALLBACK="true" # Use guest-agent exec to fetch gateways from VM OS
+export PVE_NB_IP_BLOCK_REPORT="false" # Optional bool. true => log NetBox prefix utilization report
+export PVE_NB_IP_BLOCK_REPORT_PATH="" # Optional CSV output path for prefix report (e.g. "/tmp/ip-block-report.csv")
 
 # NetBox objects
 export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slug

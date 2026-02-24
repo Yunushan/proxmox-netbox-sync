@@ -5,6 +5,7 @@ import ipaddress
 import socket
 import re
 import json
+import csv
 import base64
 import binascii
 import time
@@ -341,6 +342,8 @@ NODE_ILO_NPM_PASSWORD_ENV = "PVE_NODE_ILO_NPM_PASSWORD"
 NODE_ILO_NPM_VERIFY_SSL_ENV = "PVE_NODE_ILO_NPM_VERIFY_SSL"
 NODE_ILO_NPM_PREFIX_ENV = "PVE_NODE_ILO_NPM_PREFIX"
 NODE_ILO_DOMAIN_SUFFIXES_ENV = "PVE_NODE_ILO_DOMAIN_SUFFIXES"
+IP_BLOCK_REPORT_ENV = "PVE_NB_IP_BLOCK_REPORT"
+IP_BLOCK_REPORT_PATH_ENV = "PVE_NB_IP_BLOCK_REPORT_PATH"
 
 
 def parse_sync_mode(value: str) -> str:
@@ -4180,6 +4183,170 @@ def delete_missing_netbox_vms(nb, cluster, keep_names: Set[str], keep_vm_ids: Se
 
 
 # ---------------------------------------------------------------------------
+# IP block reporting
+# ---------------------------------------------------------------------------
+
+def describe_related_value(value: Optional[object]) -> str:
+    if value is None:
+        return "-"
+
+    if isinstance(value, dict):
+        for key in ("name", "display", "label", "value", "slug", "id"):
+            raw = value.get(key)
+            if raw not in (None, ""):
+                return str(raw)
+        return "-"
+
+    for attr in ("name", "display", "label", "value", "slug", "id"):
+        raw = getattr(value, attr, None)
+        if raw not in (None, ""):
+            return str(raw)
+
+    return str(value)
+
+
+def build_ip_block_report_rows(nb, site) -> List[dict]:
+    query: Dict[str, object] = {}
+    if site and getattr(site, "id", None):
+        query["site_id"] = site.id
+
+    prefixes = list(nb.ipam.prefixes.filter(**query))
+    rows: List[dict] = []
+
+    for prefix in prefixes:
+        prefix_cidr = str(getattr(prefix, "prefix", "") or "").strip()
+        if not prefix_cidr:
+            continue
+
+        try:
+            network = ipaddress.ip_network(prefix_cidr, strict=False)
+        except ValueError as exc:
+            LOG.warning("IP block report: skipping invalid prefix '%s': %s", prefix_cidr, exc)
+            continue
+
+        used_ips = 0
+        try:
+            used_ips = len(list(nb.ipam.ip_addresses.filter(parent=prefix_cidr)))
+        except Exception as exc:
+            LOG.warning("IP block report: failed to count IPs in %s: %s", prefix_cidr, exc)
+
+        total_ips = int(network.num_addresses)
+        free_ips = max(total_ips - used_ips, 0)
+        utilization_pct = (used_ips / total_ips * 100.0) if total_ips else 0.0
+
+        vlan_obj = getattr(prefix, "vlan", None)
+        vlan_vid = parse_int(vlan_obj.get("vid")) if isinstance(vlan_obj, dict) else parse_int(getattr(vlan_obj, "vid", None))
+        vlan_label = describe_related_value(vlan_obj)
+        if vlan_obj is None:
+            vlan_value = "-"
+        elif vlan_vid is None:
+            vlan_value = vlan_label
+        elif vlan_label in ("-", str(vlan_vid)):
+            vlan_value = str(vlan_vid)
+        else:
+            vlan_value = f"{vlan_vid} ({vlan_label})"
+
+        is_pool = parse_bool(getattr(prefix, "is_pool", None))
+        is_pool_text = "true" if is_pool is True else "false" if is_pool is False else "-"
+
+        rows.append(
+            {
+                "prefix": prefix_cidr,
+                "family": network.version,
+                "prefix_length": network.prefixlen,
+                "site": describe_related_value(getattr(prefix, "site", None)),
+                "vrf": describe_related_value(getattr(prefix, "vrf", None)),
+                "vlan": vlan_value,
+                "status": describe_related_value(getattr(prefix, "status", None)),
+                "is_pool": is_pool_text,
+                "total_ips": total_ips,
+                "used_ips": used_ips,
+                "free_ips": free_ips,
+                "utilization_pct": round(utilization_pct, 2),
+                "_network_int": int(network.network_address),
+            }
+        )
+
+    rows.sort(key=lambda row: (row["family"], row["_network_int"], row["prefix_length"]))
+    return rows
+
+
+def write_ip_block_report_csv(rows: List[dict], csv_path: str) -> None:
+    output_path = (csv_path or "").strip()
+    if not output_path:
+        return
+
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    fieldnames = [
+        "prefix",
+        "family",
+        "prefix_length",
+        "site",
+        "vrf",
+        "vlan",
+        "status",
+        "is_pool",
+        "total_ips",
+        "used_ips",
+        "free_ips",
+        "utilization_pct",
+    ]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def maybe_report_ip_blocks(nb, site) -> None:
+    enabled = parse_bool(env(IP_BLOCK_REPORT_ENV, "false"))
+    if not enabled:
+        return
+
+    scope_label = "all sites"
+    if site and getattr(site, "name", None):
+        scope_label = f"site={site.name}"
+
+    try:
+        rows = build_ip_block_report_rows(nb, site)
+    except Exception as exc:
+        LOG.error("IP block report failed while building data: %s", exc)
+        return
+
+    if not rows:
+        LOG.info("IP block report: no prefixes found (%s)", scope_label)
+        return
+
+    LOG.info("IP block report (%s): %d prefixes", scope_label, len(rows))
+    for row in rows:
+        LOG.info(
+            "Prefix=%s used=%d free=%d total=%d util=%.2f%% site=%s vrf=%s vlan=%s status=%s pool=%s",
+            row["prefix"],
+            row["used_ips"],
+            row["free_ips"],
+            row["total_ips"],
+            row["utilization_pct"],
+            row["site"],
+            row["vrf"],
+            row["vlan"],
+            row["status"],
+            row["is_pool"],
+        )
+
+    csv_path = (env(IP_BLOCK_REPORT_PATH_ENV, "") or "").strip()
+    if csv_path:
+        try:
+            write_ip_block_report_csv(rows, csv_path)
+            LOG.info("IP block report CSV written to %s", csv_path)
+        except Exception as exc:
+            LOG.error("Failed to write IP block report CSV to %s: %s", csv_path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -4224,6 +4391,8 @@ def main():
 
     if delete_missing:
         delete_missing_netbox_vms(nb, cluster, synced_vm_names, synced_vm_ids)
+
+    maybe_report_ip_blocks(nb, site)
 
 
 if __name__ == "__main__":
