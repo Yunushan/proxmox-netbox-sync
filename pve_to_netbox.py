@@ -1806,7 +1806,127 @@ def get_or_create_vlan(nb, vid: int, site) -> object:
     return vlan
 
 
-def parse_vm_nic_config(net_value: str) -> Dict[str, Optional[object]]:
+MAC_ADDRESS_RE = re.compile(r"^[0-9A-F]{12}$")
+PVE_NIC_MAC_KEYS = {
+    "virtio",
+    "e1000",
+    "e1000e",
+    "rtl8139",
+    "vmxnet3",
+    "hwaddr",
+    "mac",
+    "macaddr",
+    "address",
+}
+
+
+def normalize_mac_address(value: Optional[object]) -> Optional[str]:
+    if value is None:
+        return None
+
+    raw = str(value).strip().upper()
+    if not raw:
+        return None
+
+    # Accept common separators (":", "-", ".") and normalize to "AA:BB:CC:DD:EE:FF".
+    compact = re.sub(r"[^0-9A-F]", "", raw)
+    if not MAC_ADDRESS_RE.fullmatch(compact):
+        return None
+    return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
+
+
+def get_related_object_id(value: Optional[object]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        return parse_int(value.get("id"))
+    return parse_int(getattr(value, "id", None))
+
+
+def normalize_choice_value(value: Optional[object]) -> Optional[str]:
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("label")
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def ensure_vm_interface_mac(nb, iface, mac: Optional[str]) -> bool:
+    target_mac = normalize_mac_address(mac)
+    if not target_mac:
+        return False
+
+    iface_label = f"{getattr(iface, 'name', '?')} (id={getattr(iface, 'id', '?')})"
+    current_mac = normalize_mac_address(getattr(iface, "mac_address", None))
+    if current_mac == target_mac:
+        return False
+
+    # NetBox <4 compatibility path where interface has a direct mac_address field.
+    try:
+        iface.mac_address = target_mac
+        save_netbox_object_with_retry(iface, f"updating MAC on VM interface {iface_label}")
+        return True
+    except Exception as exc:
+        LOG.debug(
+            "Direct mac_address update failed for VM interface %s; trying dcim.mac-addresses fallback: %s",
+            iface_label,
+            exc,
+        )
+
+    mac_endpoint = getattr(getattr(nb, "dcim", None), "mac_addresses", None)
+    if mac_endpoint is None:
+        LOG.warning("Unable to set MAC %s on VM interface %s", target_mac, iface_label)
+        return False
+
+    mac_obj = None
+    try:
+        existing = list(
+            mac_endpoint.filter(
+                assigned_object_type="virtualization.vminterface",
+                assigned_object_id=iface.id,
+            )
+        )
+    except Exception as exc:
+        LOG.warning("Failed to query existing MAC objects for VM interface %s: %s", iface_label, exc)
+        existing = []
+
+    for candidate in existing:
+        candidate_mac = normalize_mac_address(getattr(candidate, "mac_address", None))
+        if candidate_mac == target_mac:
+            mac_obj = candidate
+            break
+
+    if mac_obj is None:
+        try:
+            mac_obj = mac_endpoint.create(
+                {
+                    "mac_address": target_mac,
+                    "assigned_object_type": "virtualization.vminterface",
+                    "assigned_object_id": iface.id,
+                }
+            )
+        except Exception as exc:
+            LOG.warning("Failed to create MAC %s for VM interface %s: %s", target_mac, iface_label, exc)
+            return False
+
+    mac_id = get_related_object_id(mac_obj)
+    if mac_id and hasattr(iface, "primary_mac_address"):
+        try:
+            iface.primary_mac_address = mac_id
+            save_netbox_object_with_retry(
+                iface,
+                f"setting primary MAC on VM interface {iface_label}",
+            )
+        except Exception as exc:
+            LOG.debug("Failed to set primary MAC on VM interface %s: %s", iface_label, exc)
+
+    return True
+
+
+def parse_vm_nic_config(net_value: Optional[object], nic_name: str = "net0") -> Dict[str, Optional[object]]:
     """
     Parse a Proxmox 'net0' style string, e.g.:
 
@@ -1815,29 +1935,59 @@ def parse_vm_nic_config(net_value: str) -> Dict[str, Optional[object]]:
     Returns dict with keys: name, mac, bridge, vlan.
     """
     if not net_value:
-        return {"name": "net0", "mac": None, "bridge": None, "vlan": None}
+        return {"name": nic_name, "mac": None, "bridge": None, "vlan": None}
 
     mac = None
     bridge = None
     vlan = None
 
-    for part in net_value.split(","):
+    for part in str(net_value).split(","):
+        part = part.strip()
+        if not part:
+            continue
         if "=" not in part:
+            if mac is None:
+                mac = normalize_mac_address(part)
             continue
         key, val = part.split("=", 1)
-        key = key.strip()
+        key = key.strip().lower()
         val = val.strip()
-        if key in ("virtio", "e1000", "rtl8139", "vmxnet3"):
-            mac = val.upper()
+        if not val:
+            continue
+
+        if key in PVE_NIC_MAC_KEYS:
+            parsed_mac = normalize_mac_address(val)
+            if parsed_mac:
+                mac = parsed_mac
         elif key == "bridge":
             bridge = val
         elif key == "tag":
-            try:
-                vlan = int(val)
-            except ValueError:
-                pass
+            parsed_vlan = parse_int(val)
+            if parsed_vlan is not None and 1 <= parsed_vlan <= 4094:
+                vlan = parsed_vlan
+        elif mac is None:
+            parsed_mac = normalize_mac_address(val)
+            if parsed_mac:
+                mac = parsed_mac
 
-    return {"name": "net0", "mac": mac, "bridge": bridge, "vlan": vlan}
+    return {"name": nic_name, "mac": mac, "bridge": bridge, "vlan": vlan}
+
+
+def extract_vm_nic_configs(config: Optional[dict]) -> List[Dict[str, Optional[object]]]:
+    if not isinstance(config, dict):
+        return []
+
+    parsed: List[Tuple[int, Dict[str, Optional[object]]]] = []
+    for key, value in config.items():
+        key_text = str(key).strip().lower()
+        match = re.fullmatch(r"net(\d+)", key_text)
+        if not match:
+            continue
+        idx = int(match.group(1))
+        parsed.append((idx, parse_vm_nic_config(value, nic_name=f"net{idx}")))
+
+    parsed.sort(key=lambda item: item[0])
+    return [nic for _, nic in parsed]
 
 
 def parse_gateway_settings(raw_value: str) -> Tuple[Optional[str], bool, Optional[str], bool]:
@@ -3303,77 +3453,120 @@ def ensure_vm_interface_and_ips(
     VLANs are auto-created when needed.
     IPs come from qemu-guest-agent for QEMU guests.
     """
-    # Get VM interface config (net0) from Proxmox
+    # Get VM interface config (netX) from Proxmox
     if config is None:
         config = fetch_vm_config(proxmox, node_name, vmid, pve_type) or {}
     else:
         config = config or {}
 
-    nic_info = parse_vm_nic_config(config.get("net0", ""))
-    mac = nic_info["mac"]
-    vlan_vid = nic_info["vlan"]
+    nic_infos = extract_vm_nic_configs(config)
+    if not nic_infos:
+        nic_infos = [parse_vm_nic_config(config.get("net0", ""), nic_name="net0")]
 
-    # Default logical name from Proxmox (net0), overridden by guest name if available
-    iface_name = nic_info["name"] or "net0"
-    guest_name = get_guest_interface_name(proxmox, node_name, vmid, pve_type, mac)
-    if guest_name:
-        iface_name = guest_name
+    primary_iface = None
+    primary_iface_name = None
 
-    # Try to find interface by guest name first
-    iface = nb.virtualization.interfaces.get(
-        name=iface_name,
-        virtual_machine_id=nb_vm.id,
-    )
+    for nic_info in nic_infos:
+        mac = normalize_mac_address(nic_info.get("mac"))
+        vlan_vid = parse_int(nic_info.get("vlan"))
+        source_iface_name = (str(nic_info.get("name") or "net0").strip() or "net0")
 
-    # Migration path: if we previously created "net0", rename it to guest name
-    if not iface and iface_name != "net0":
-        old_iface = nb.virtualization.interfaces.get(
-            name="net0",
+        # Use guest agent name only when NIC MAC is known; this avoids guessing wrong mappings.
+        guest_name = None
+        if mac:
+            guest_name = get_guest_interface_name(proxmox, node_name, vmid, pve_type, mac)
+        iface_name = guest_name or source_iface_name
+
+        iface = nb.virtualization.interfaces.get(
+            name=iface_name,
             virtual_machine_id=nb_vm.id,
         )
-        if old_iface:
-            LOG.info(
-                "Renaming NetBox VM interface net0 -> %s on VM %s",
-                iface_name,
-                nb_vm.name,
+
+        # Migration path: if we previously created netX, rename it to guest name.
+        if not iface and guest_name and source_iface_name != guest_name:
+            old_iface = nb.virtualization.interfaces.get(
+                name=source_iface_name,
+                virtual_machine_id=nb_vm.id,
             )
-            old_iface.name = iface_name
-            old_iface.save()
-            iface = old_iface
+            if old_iface:
+                LOG.info(
+                    "Renaming NetBox VM interface %s -> %s on VM %s",
+                    source_iface_name,
+                    guest_name,
+                    nb_vm.name,
+                )
+                old_iface.name = guest_name
+                save_netbox_object_with_retry(
+                    old_iface,
+                    f"renaming VM interface {source_iface_name} to {guest_name}",
+                )
+                iface = old_iface
 
-    vlan_obj = None
-    if vlan_vid is not None:
-        vlan_obj = get_or_create_vlan(nb, vlan_vid, site)
+        vlan_obj = None
+        if vlan_vid is not None:
+            vlan_obj = get_or_create_vlan(nb, vlan_vid, site)
 
-    if not iface:
-        LOG.info("Creating NetBox VM interface %s on VM %s", iface_name, nb_vm.name)
-        payload = {
-            "name": iface_name,
-            "virtual_machine": nb_vm.id,
-            "enabled": True,
-        }
-        if mac:
-            payload["mac_address"] = mac
-        if vlan_obj:
-            payload["mode"] = "access"
-            payload["untagged_vlan"] = vlan_obj.id
+        if not iface:
+            LOG.info("Creating NetBox VM interface %s on VM %s", iface_name, nb_vm.name)
+            payload = {
+                "name": iface_name,
+                "virtual_machine": nb_vm.id,
+                "enabled": True,
+            }
+            if mac:
+                payload["mac_address"] = mac
+            if vlan_obj:
+                payload["mode"] = "access"
+                payload["untagged_vlan"] = vlan_obj.id
 
-        iface = nb.virtualization.interfaces.create(payload)
-    else:
-        changed = False
-        if mac and (iface.mac_address or "").upper() != mac:
-            iface.mac_address = mac
-            changed = True
+            try:
+                iface = nb.virtualization.interfaces.create(payload)
+            except RequestError as exc:
+                err_text = str(getattr(exc, "error", exc)).lower()
+                if mac and (
+                    "mac_address" in err_text
+                    or "primary_mac_address" in err_text
+                    or "mac address" in err_text
+                ):
+                    LOG.debug(
+                        "Retrying VM interface create for %s on %s without mac_address due to API validation",
+                        iface_name,
+                        nb_vm.name,
+                    )
+                    payload.pop("mac_address", None)
+                    iface = nb.virtualization.interfaces.create(payload)
+                else:
+                    raise
+        else:
+            changed = False
+            if vlan_obj:
+                current_mode = normalize_choice_value(getattr(iface, "mode", None))
+                current_vlan_id = get_related_object_id(getattr(iface, "untagged_vlan", None))
+                if current_mode != "access" or current_vlan_id != vlan_obj.id:
+                    iface.mode = "access"
+                    iface.untagged_vlan = vlan_obj.id
+                    changed = True
 
-        if vlan_obj:
-            # Access port with untagged VLAN
-            iface.mode = "access"
-            iface.untagged_vlan = vlan_obj
-            changed = True
+            if changed:
+                LOG.info("Updating NetBox VM interface %s on VM %s", iface_name, nb_vm.name)
+                save_netbox_object_with_retry(
+                    iface,
+                    f"updating VM interface {iface_name} on {nb_vm.name}",
+                )
 
-        if changed:
-            LOG.info("Updating NetBox VM interface %s on VM %s", iface_name, nb_vm.name)
-            iface.save()
+        if iface and mac:
+            ensure_vm_interface_mac(nb, iface, mac)
+
+        if iface and primary_iface is None:
+            primary_iface = iface
+            primary_iface_name = iface_name
+
+    if primary_iface is None:
+        return
+
+    # Keep existing behavior: attach discovered guest IPs to the first VM NIC.
+    iface = primary_iface
+    iface_name = primary_iface_name or "net0"
 
     # Fetch IPs from guest (QEMU only for now)
     ips = fetch_guest_ips(proxmox, node_name, vmid, pve_type)
