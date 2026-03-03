@@ -2655,7 +2655,28 @@ def fetch_guest_ips(
                 continue
 
             family = 6 if ":" in ip else 4
-            ips.append((ip, int(prefix), family))
+            try:
+                prefix_int = int(prefix)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "Guest agent returned invalid prefix %r for IP %s on vmid=%s; skipping",
+                    prefix,
+                    ip,
+                    vmid,
+                )
+                continue
+
+            max_prefix = 128 if family == 6 else 32
+            if not (0 <= prefix_int <= max_prefix):
+                LOG.warning(
+                    "Guest agent returned out-of-range prefix %s for IP %s on vmid=%s; skipping",
+                    prefix_int,
+                    ip,
+                    vmid,
+                )
+                continue
+
+            ips.append((ip, prefix_int, family))
 
     return ips
 
@@ -3623,15 +3644,20 @@ def ensure_vm_interface_and_ips(
         cidr = f"{ip}/{prefix}"
         ip_obj = None
 
-        # Skip network or broadcast addresses; NetBox rejects these on interfaces
+        # Skip only true invalid IPv4 network/broadcast addresses.
+        # /31 and /32 are valid host assignments and must not be skipped.
         try:
             ip_addr = ipaddress.ip_address(ip)
             network = ipaddress.ip_network(cidr, strict=False)
-            is_network = ip_addr == network.network_address
+            is_network = (
+                isinstance(network, ipaddress.IPv4Network)
+                and network.prefixlen <= 30
+                and ip_addr == network.network_address
+            )
             is_broadcast = (
                 isinstance(network, ipaddress.IPv4Network)
+                and network.prefixlen <= 30
                 and ip_addr == network.broadcast_address
-                and network.num_addresses > 1
             )
             if is_network or is_broadcast:
                 LOG.warning(
