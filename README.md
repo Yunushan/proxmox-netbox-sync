@@ -28,6 +28,7 @@ pip install proxmoxer pynetbox requests
    ```
 2. Required variables:
    - `PVE_HOST`, `PVE_USER`, `PVE_TOKEN_NAME`, `PVE_TOKEN_VALUE`, `PVE_VERIFY_SSL`
+   - Optional Proxmox API timeout: `PVE_API_TIMEOUT` (seconds, defaults to `60`)
    - `NB_URL`, `NB_TOKEN`, `NB_VERIFY_SSL`
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
   - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
@@ -82,6 +83,7 @@ pip install proxmoxer pynetbox requests
 
 - **Safe update** (default / `PVE_NB_SYNC_MODE=1`): Creates/updates VMs, interfaces, IPs. Nothing is removed from NetBox.
 - **Full sync** (`PVE_NB_SYNC_MODE=2`): After syncing, deletes NetBox VMs in the target cluster that are not present in Proxmox. Matching is name-based but also vmid-aware (vmid is stored in comments) to avoid deleting renamed VMs/templates.
+  - Safety behavior: if VM enumeration fails on any node in a run, deletion is skipped for that run.
 
 ## Required API permissions
 

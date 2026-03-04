@@ -344,6 +344,7 @@ NODE_ILO_NPM_PREFIX_ENV = "PVE_NODE_ILO_NPM_PREFIX"
 NODE_ILO_DOMAIN_SUFFIXES_ENV = "PVE_NODE_ILO_DOMAIN_SUFFIXES"
 IP_BLOCK_REPORT_ENV = "PVE_NB_IP_BLOCK_REPORT"
 IP_BLOCK_REPORT_PATH_ENV = "PVE_NB_IP_BLOCK_REPORT_PATH"
+PVE_API_TIMEOUT_ENV = "PVE_API_TIMEOUT"
 
 
 def parse_sync_mode(value: str) -> str:
@@ -416,11 +417,20 @@ def connect_proxmox(
     token_name = env("PVE_TOKEN_NAME", required=True) # token ID
     token_value = env("PVE_TOKEN_VALUE", required=True)
     verify_ssl = env("PVE_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+    timeout_raw = env(PVE_API_TIMEOUT_ENV, "60")
+    timeout_s = parse_int(timeout_raw)
+    if timeout_s is None or timeout_s < 1:
+        LOG.warning(
+            "Invalid %s=%r; using default timeout 60s",
+            PVE_API_TIMEOUT_ENV,
+            timeout_raw,
+        )
+        timeout_s = 60
 
     if port_override is not None:
         port = port_override
 
-    LOG.info("Connecting to Proxmox at %s as %s", host, user)
+    LOG.info("Connecting to Proxmox at %s as %s (timeout=%ss)", host, user, timeout_s)
 
     proxmox_kwargs = {
         "user": user,
@@ -428,6 +438,7 @@ def connect_proxmox(
         "token_value": token_value,
         "verify_ssl": verify_ssl,
         "service": "PVE",
+        "timeout": timeout_s,
     }
     if port:
         proxmox_kwargs["port"] = port
@@ -1073,11 +1084,12 @@ def fetch_vm_config(
     vmid: int,
     pve_type: str,
 ) -> Optional[dict]:
+    node_proxmox = get_node_proxmox(proxmox, node_name)
     try:
         if pve_type == "qemu":
-            return proxmox.nodes(node_name).qemu(vmid).config.get()
+            return node_proxmox.nodes(node_name).qemu(vmid).config.get()
         if pve_type == "lxc":
-            return proxmox.nodes(node_name).lxc(vmid).config.get()
+            return node_proxmox.nodes(node_name).lxc(vmid).config.get()
     except Exception as exc:
         LOG.debug("Failed to fetch config for vmid=%s (%s): %s", vmid, pve_type, exc)
     return None
@@ -3879,7 +3891,7 @@ def sync_vms(
     vm_resource_map: Dict[int, dict],
     vm_cf_specs: Dict[str, Optional[List[dict]]],
     sync_timestamp: str,
-) -> Tuple[Set[str], Set[int]]:
+) -> Tuple[Set[str], Set[int], Set[str]]:
     """
     Sync all Proxmox VMs (QEMU + LXC) into NetBox virtualization.virtual_machines.
 
@@ -3887,30 +3899,36 @@ def sync_vms(
       - /nodes/{node}/qemu
       - /nodes/{node}/lxc
 
-    Returns (names_seen, vmids_seen) so deletion logic can be vmid-aware.
+    Returns (names_seen, vmids_seen, failed_nodes) so deletion logic can be vmid-aware
+    and can be safely skipped when node enumeration fails.
     """
     nodes = proxmox.nodes.get()
+    nodes = sorted(nodes, key=lambda item: str(item.get("node", "")))
     total_vms = 0
     synced_vm_names: Set[str] = set()
     synced_vm_ids: Set[int] = set()
+    failed_nodes: Set[str] = set()
 
     for node in nodes:
         node_name = node["node"]
         host_device = node_devices.get(node_name)
+        node_proxmox = get_node_proxmox(proxmox, node_name)
 
         # ----- QEMU guests -----
         try:
-            qemus = proxmox.nodes(node_name).qemu.get()
+            qemus = node_proxmox.nodes(node_name).qemu.get()
         except Exception as exc:
             LOG.error("Failed to query QEMU VMs on node %s: %s", node_name, exc)
             qemus = []
+            failed_nodes.add(node_name)
 
         # ----- LXC containers -----
         try:
-            lxcs = proxmox.nodes(node_name).lxc.get()
+            lxcs = node_proxmox.nodes(node_name).lxc.get()
         except Exception as exc:
             LOG.error("Failed to query LXC containers on node %s: %s", node_name, exc)
             lxcs = []
+            failed_nodes.add(node_name)
 
         LOG.info(
             "Node %s: found %d QEMU VMs and %d LXC containers",
@@ -3964,7 +3982,13 @@ def sync_vms(
             sync_and_track_vm(vm, "lxc")
 
     LOG.info("Total Proxmox guests synced (QEMU + LXC): %d", total_vms)
-    return synced_vm_names, synced_vm_ids
+    if failed_nodes:
+        LOG.warning(
+            "Node VM enumeration failed for %d node(s): %s",
+            len(failed_nodes),
+            ", ".join(sorted(failed_nodes)),
+        )
+    return synced_vm_names, synced_vm_ids, failed_nodes
 
 
 def sync_single_vm(
@@ -4487,7 +4511,7 @@ def main():
     vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
     sync_node_ilo_addresses(nb, node_devices)
-    synced_vm_names, synced_vm_ids = sync_vms(
+    synced_vm_names, synced_vm_ids, failed_nodes = sync_vms(
         nb,
         proxmox,
         cluster,
@@ -4500,7 +4524,13 @@ def main():
     )
 
     if delete_missing:
-        delete_missing_netbox_vms(nb, cluster, synced_vm_names, synced_vm_ids)
+        if failed_nodes:
+            LOG.error(
+                "Full sync deletion is skipped because node VM enumeration failed: %s",
+                ", ".join(sorted(failed_nodes)),
+            )
+        else:
+            delete_missing_netbox_vms(nb, cluster, synced_vm_names, synced_vm_ids)
 
     maybe_report_ip_blocks(nb, site)
 
