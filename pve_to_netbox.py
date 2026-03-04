@@ -2584,7 +2584,57 @@ def fetch_guest_agent_interfaces(
         LOG.debug("No guest-agent data for vmid=%s on %s: %s", vmid, node_name, exc)
         return []
 
-    return result.get("result", [])
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+
+    if isinstance(result, dict):
+        interfaces = result.get("result")
+        if isinstance(interfaces, list):
+            return [item for item in interfaces if isinstance(item, dict)]
+
+        interfaces = result.get("data")
+        if isinstance(interfaces, list):
+            return [item for item in interfaces if isinstance(item, dict)]
+
+    LOG.debug(
+        "Unexpected network-get-interfaces payload for vmid=%s on %s: type=%s",
+        vmid,
+        node_name,
+        type(result).__name__,
+    )
+    return []
+
+
+def parse_guest_ip_prefix(prefix: Optional[object], ip: str) -> Optional[int]:
+    family = 6 if ":" in ip else 4
+    max_prefix = 128 if family == 6 else 32
+
+    if prefix is None:
+        # If guest agent omits prefix, keep address visibility by falling back to host-only.
+        return max_prefix
+
+    if isinstance(prefix, int):
+        prefix_int = prefix
+    else:
+        raw = str(prefix).strip()
+        if not raw:
+            return max_prefix
+        try:
+            prefix_int = int(raw)
+        except (TypeError, ValueError):
+            # Some Windows guests may return netmask instead of prefix length.
+            if family == 4:
+                try:
+                    network = ipaddress.ip_network(f"0.0.0.0/{raw}", strict=False)
+                    prefix_int = int(network.prefixlen)
+                except ValueError:
+                    return None
+            else:
+                return None
+
+    if 0 <= prefix_int <= max_prefix:
+        return prefix_int
+    return None
 
 
 def get_guest_interface_name(
@@ -2639,44 +2689,61 @@ def fetch_guest_ips(
         return []
 
     ips: List[Tuple[str, int, int]] = []
+    seen: Set[Tuple[str, int, int]] = set()
 
     for iface in interfaces:
-        for ip_info in iface.get("ip-addresses", []):
-            ip = ip_info.get("ip-address")
-            prefix = ip_info.get("prefix")
-            if not ip or prefix is None:
+        ip_infos = iface.get("ip-addresses")
+        if not isinstance(ip_infos, list):
+            continue
+
+        for ip_info in ip_infos:
+            if not isinstance(ip_info, dict):
+                continue
+
+            ip_raw = ip_info.get("ip-address")
+            if ip_raw is None:
+                continue
+
+            ip = str(ip_raw).strip()
+            if not ip:
                 continue
 
             # Skip loopback
-            if ip.startswith("127."):
+            if ip == "::1" or ip.startswith("127."):
                 continue
             # Skip IPv6 link-local for now
             if ":" in ip and ip.lower().startswith("fe80:"):
                 continue
 
-            family = 6 if ":" in ip else 4
             try:
-                prefix_int = int(prefix)
-            except (TypeError, ValueError):
+                ip_obj = ipaddress.ip_address(ip)
+            except ValueError:
+                LOG.warning(
+                    "Guest agent returned invalid IP %r for vmid=%s on %s; skipping",
+                    ip,
+                    vmid,
+                    node_name,
+                )
+                continue
+
+            family = 6 if ":" in ip else 4
+            if ip_obj.version != family:
+                continue
+
+            prefix_int = parse_guest_ip_prefix(ip_info.get("prefix"), ip)
+            if prefix_int is None:
                 LOG.warning(
                     "Guest agent returned invalid prefix %r for IP %s on vmid=%s; skipping",
-                    prefix,
+                    ip_info.get("prefix"),
                     ip,
                     vmid,
                 )
                 continue
 
-            max_prefix = 128 if family == 6 else 32
-            if not (0 <= prefix_int <= max_prefix):
-                LOG.warning(
-                    "Guest agent returned out-of-range prefix %s for IP %s on vmid=%s; skipping",
-                    prefix_int,
-                    ip,
-                    vmid,
-                )
-                continue
-
-            ips.append((ip, prefix_int, family))
+            item = (ip, prefix_int, family)
+            if item not in seen:
+                seen.add(item)
+                ips.append(item)
 
     return ips
 
@@ -2691,7 +2758,7 @@ def extract_vmid_from_comments(comments: Optional[str]) -> Optional[int]:
     """
     if not comments:
         return None
-    match = re.search(r"vmid=(\\d+)", comments)
+    match = re.search(r"vmid=(\d+)", comments)
     if match:
         try:
             return int(match.group(1))
@@ -3751,6 +3818,23 @@ def ensure_vm_interface_and_ips(
             if ao_type == "virtualization.vminterface" and ao_id == iface.id:
                 # Already attached correctly; nothing to change.
                 pass
+            elif not ao_type and not ao_id:
+                try:
+                    ip_obj.status = "active"
+                    ip_obj.assigned_object_type = "virtualization.vminterface"
+                    ip_obj.assigned_object_id = iface.id
+                    save_netbox_object_with_retry(
+                        ip_obj,
+                        f"assigning existing IP {cidr} to VM interface {iface_name}",
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to assign existing unassigned IP %s to %s: %s",
+                        cidr,
+                        iface_name,
+                        exc,
+                    )
+                    continue
             else:
                 # It belongs to someone else (maybe primary IP there). Do not reassign.
                 LOG.warning(
