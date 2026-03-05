@@ -26,7 +26,7 @@ export PVE_NODE_ILO_INTERFACE="iLO"   # Optional NetBox interface name for node 
 export PVE_NODE_ILO_SET_PRIMARY="true" # Set node primary_ip4/primary_ip6 from resolved iLO IP
 
 # Optional Forti public IP sync (disabled by default)
-export PVE_FORTI_PUBLIC_IP_SYNC="false" # Optional bool. true => sync Forti public IPv4/IPv6 to NetBox.
+export PVE_FORTI_PUBLIC_IP_SYNC="false" # Optional bool. true => sync public IPv4/IPv6 from Forti interfaces, VIPs, and IP pools.
 export PVE_FORTI_URL=""                 # Forti base URL (e.g. "https://forti.example.net")
 export PVE_FORTI_API_TOKEN=""           # Preferred auth for REST API admin users
 export PVE_FORTI_USERNAME=""            # Optional session auth user (e.g. super_admin_readonly)
@@ -35,6 +35,7 @@ export PVE_FORTI_VERIFY_SSL="false"     # Verify Forti TLS certificate
 export PVE_FORTI_VDOM="root"            # Forti VDOM to query
 export PVE_FORTI_TIMEOUT="20"           # Forti API timeout in seconds
 export PVE_FORTI_WAN_INTERFACES=""      # Optional preferred WAN interfaces (e.g. "wan1,wan2")
+export PVE_FORTI_MAX_RANGE_EXPANSION="2048" # Max addresses expanded from VIP/IP pool ranges per object
 
 # Netbox
 export NB_URL="https://netbox.example.com"   # NetBox base URL

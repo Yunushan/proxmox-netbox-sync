@@ -354,6 +354,7 @@ FORTI_VERIFY_SSL_ENV = "PVE_FORTI_VERIFY_SSL"
 FORTI_VDOM_ENV = "PVE_FORTI_VDOM"
 FORTI_TIMEOUT_ENV = "PVE_FORTI_TIMEOUT"
 FORTI_WAN_INTERFACES_ENV = "PVE_FORTI_WAN_INTERFACES"
+FORTI_MAX_RANGE_EXPANSION_ENV = "PVE_FORTI_MAX_RANGE_EXPANSION"
 NB_FORTI_DEVICE_ENV = "NB_FORTI_DEVICE"
 NB_FORTI_INTERFACE_ENV = "NB_FORTI_INTERFACE"
 NB_FORTI_SET_PRIMARY_ENV = "NB_FORTI_SET_PRIMARY"
@@ -1288,7 +1289,193 @@ def collect_forti_interface_records(client: dict, vdom: str) -> List[dict]:
     return []
 
 
-def build_forti_public_ip_candidates(interface_records: List[dict], family: int) -> List[dict]:
+def collect_forti_vip_records(client: dict, vdom: str) -> List[dict]:
+    try:
+        payload = forti_api_get_json(
+            client,
+            "/api/v2/cmdb/firewall/vip",
+            {"vdom": vdom, "format": "name|extip|extip6|extintf|status|type"},
+        )
+        return parse_forti_result_items(payload)
+    except Exception as exc:
+        LOG.warning("Forti VIP query failed for /api/v2/cmdb/firewall/vip: %s", exc)
+        return []
+
+
+def collect_forti_ippool_records(client: dict, vdom: str, family: int) -> List[dict]:
+    path = "/api/v2/cmdb/firewall/ippool6" if family == 6 else "/api/v2/cmdb/firewall/ippool"
+    try:
+        payload = forti_api_get_json(
+            client,
+            path,
+            {
+                "vdom": vdom,
+                "format": (
+                    "name|startip|endip|startip6|endip6|source-startip|source-endip|"
+                    "source-startip6|source-endip6|associated-interface|arp-intf|status|type"
+                ),
+            },
+        )
+        return parse_forti_result_items(payload)
+    except Exception as exc:
+        LOG.warning("Forti IP pool query failed for %s: %s", path, exc)
+        return []
+
+
+def parse_forti_max_range_expansion() -> int:
+    value = parse_int(env(FORTI_MAX_RANGE_EXPANSION_ENV, "2048"))
+    if value is None or value < 1:
+        return 2048
+    return value
+
+
+def expand_forti_ip_range(start_ip: str, end_ip: str, family: int, max_items: int) -> List[str]:
+    try:
+        start_addr = ipaddress.ip_address((start_ip or "").strip())
+        end_addr = ipaddress.ip_address((end_ip or "").strip())
+    except ValueError:
+        return []
+
+    expected_type = ipaddress.IPv4Address if family == 4 else ipaddress.IPv6Address
+    if not isinstance(start_addr, expected_type) or not isinstance(end_addr, expected_type):
+        return []
+
+    start_int = int(start_addr)
+    end_int = int(end_addr)
+    if end_int < start_int:
+        start_int, end_int = end_int, start_int
+
+    count = end_int - start_int + 1
+    if count > max_items:
+        LOG.warning(
+            "Skipping Forti IP range %s-%s (family=%s): %d addresses exceed %s=%d",
+            start_ip,
+            end_ip,
+            family,
+            count,
+            FORTI_MAX_RANGE_EXPANSION_ENV,
+            max_items,
+        )
+        return []
+
+    addr_type = start_addr.__class__
+    return [str(addr_type(value)) for value in range(start_int, end_int + 1)]
+
+
+def parse_forti_ip_value_or_range(raw_value: Optional[object], family: int, max_range: int) -> List[str]:
+    values: List[str] = []
+    seen: Set[str] = set()
+    expected_type = ipaddress.IPv4Address if family == 4 else ipaddress.IPv6Address
+
+    def add_ip(value: str) -> None:
+        try:
+            addr = ipaddress.ip_address((value or "").strip())
+        except ValueError:
+            return
+        if not isinstance(addr, expected_type) or addr.is_unspecified:
+            return
+        text = str(addr)
+        if text in seen:
+            return
+        seen.add(text)
+        values.append(text)
+
+    def walk(value: Optional[object]) -> None:
+        if value is None:
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk(item)
+            return
+
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key).lower()
+                if "ip" not in key_text and "addr" not in key_text and "range" not in key_text:
+                    continue
+                walk(nested)
+            return
+
+        text = str(value).strip()
+        if not text:
+            return
+
+        for token in re.split(r"[\s,;]+", text):
+            candidate = token.strip().strip("\"'[](){}")
+            if not candidate:
+                continue
+
+            if "=" in candidate and candidate.count("=") == 1:
+                key, val = candidate.split("=", 1)
+                key_text = key.strip().lower()
+                if "ip" in key_text or "addr" in key_text:
+                    candidate = val
+            candidate = candidate.strip().strip("\"'[](){}")
+            if not candidate:
+                continue
+
+            if "/" in candidate:
+                candidate = candidate.split("/", 1)[0]
+
+            if "-" in candidate and candidate.count("-") == 1:
+                start_raw, end_raw = candidate.split("-", 1)
+                expanded = expand_forti_ip_range(start_raw, end_raw, family, max_range)
+                for ip_value in expanded:
+                    add_ip(ip_value)
+                continue
+
+            add_ip(candidate)
+
+        if family == 4:
+            for match in FORTI_IPV4_RE.findall(text):
+                add_ip(match)
+
+    walk(raw_value)
+    return values
+
+
+def make_forti_public_ip_candidate(
+    family: int,
+    ip_value: str,
+    source: str,
+    interface_name: Optional[str] = None,
+    role: Optional[str] = None,
+    status: Optional[str] = None,
+    object_name: Optional[str] = None,
+) -> Optional[dict]:
+    try:
+        addr = ipaddress.ip_address(ip_value)
+    except ValueError:
+        return None
+
+    if family == 4 and not isinstance(addr, ipaddress.IPv4Address):
+        return None
+    if family == 6 and not isinstance(addr, ipaddress.IPv6Address):
+        return None
+    if (
+        addr.is_unspecified
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+    ):
+        return None
+
+    return {
+        "family": family,
+        "source": source,
+        "interface": normalize_text(interface_name) or "",
+        "role": normalize_choice_value(role) or "",
+        "status": normalize_choice_value(status) or "",
+        "object_name": normalize_text(object_name) or "",
+        "ip": str(addr),
+        "is_global": bool(addr.is_global),
+        "is_private": bool(addr.is_private),
+    }
+
+
+def build_forti_interface_public_ip_candidates(interface_records: List[dict], family: int) -> List[dict]:
     candidates: List[dict] = []
     for record in interface_records:
         if not isinstance(record, dict):
@@ -1303,34 +1490,134 @@ def build_forti_public_ip_candidates(interface_records: List[dict], family: int)
         role = normalize_choice_value(record.get("role"))
         status = normalize_choice_value(record.get("status") or record.get("link"))
         for ip in extract_forti_interface_ips(record, family):
-            try:
-                addr = ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            if family == 4 and not isinstance(addr, ipaddress.IPv4Address):
-                continue
-            if family == 6 and not isinstance(addr, ipaddress.IPv6Address):
-                continue
-            if (
-                addr.is_unspecified
-                or addr.is_loopback
-                or addr.is_link_local
-                or addr.is_multicast
-                or addr.is_reserved
-            ):
-                continue
-
-            candidates.append(
-                {
-                    "family": family,
-                    "interface": interface_name or "",
-                    "role": role or "",
-                    "status": status or "",
-                    "ip": str(addr),
-                    "is_global": bool(addr.is_global),
-                    "is_private": bool(addr.is_private),
-                }
+            candidate = make_forti_public_ip_candidate(
+                family=family,
+                ip_value=ip,
+                source="interface",
+                interface_name=interface_name,
+                role=role,
+                status=status,
             )
+            if candidate:
+                candidates.append(candidate)
+
+    return candidates
+
+
+def build_forti_vip_public_ip_candidates(vip_records: List[dict], family: int, max_range: int) -> List[dict]:
+    candidates: List[dict] = []
+    for record in vip_records:
+        if not isinstance(record, dict):
+            continue
+
+        vip_name = normalize_text(record.get("name"))
+        interface_name = normalize_text(record.get("extintf") or record.get("interface"))
+        status = normalize_choice_value(record.get("status"))
+        role = "wan"
+
+        raw_values: List[Optional[object]] = []
+        if family == 6:
+            raw_values.extend([record.get("extip6"), record.get("extip")])
+        else:
+            raw_values.append(record.get("extip"))
+
+        seen: Set[str] = set()
+        for raw in raw_values:
+            for ip in parse_forti_ip_value_or_range(raw, family, max_range):
+                if ip in seen:
+                    continue
+                seen.add(ip)
+                candidate = make_forti_public_ip_candidate(
+                    family=family,
+                    ip_value=ip,
+                    source="vip",
+                    interface_name=interface_name,
+                    role=role,
+                    status=status,
+                    object_name=vip_name,
+                )
+                if candidate:
+                    candidates.append(candidate)
+
+    return candidates
+
+
+def build_forti_ippool_public_ip_candidates(
+    ippool_records: List[dict],
+    family: int,
+    max_range: int,
+) -> List[dict]:
+    candidates: List[dict] = []
+    range_pairs = [
+        ("startip", "endip"),
+        ("start-ip", "end-ip"),
+        ("source-startip", "source-endip"),
+        ("source-start-ip", "source-end-ip"),
+        ("startip6", "endip6"),
+        ("source-startip6", "source-endip6"),
+    ]
+    standalone_keys = (
+        "startip",
+        "endip",
+        "startip6",
+        "endip6",
+        "source-startip",
+        "source-endip",
+        "source-startip6",
+        "source-endip6",
+    )
+
+    for record in ippool_records:
+        if not isinstance(record, dict):
+            continue
+
+        pool_name = normalize_text(record.get("name"))
+        interface_name = normalize_text(
+            record.get("associated-interface")
+            or record.get("associated_interface")
+            or record.get("arp-intf")
+            or record.get("arp_intf")
+            or record.get("interface")
+        )
+        status = normalize_choice_value(record.get("status"))
+        role = "wan"
+
+        ips: List[str] = []
+        seen: Set[str] = set()
+
+        def add_ips(values: List[str]) -> None:
+            for ip in values:
+                if ip in seen:
+                    continue
+                seen.add(ip)
+                ips.append(ip)
+
+        for start_key, end_key in range_pairs:
+            start_raw = normalize_text(record.get(start_key))
+            end_raw = normalize_text(record.get(end_key))
+            if start_raw and end_raw:
+                add_ips(expand_forti_ip_range(start_raw, end_raw, family, max_range))
+            elif start_raw:
+                add_ips(parse_forti_ip_value_or_range(start_raw, family, max_range))
+            elif end_raw:
+                add_ips(parse_forti_ip_value_or_range(end_raw, family, max_range))
+
+        for key in standalone_keys:
+            if key in record:
+                add_ips(parse_forti_ip_value_or_range(record.get(key), family, max_range))
+
+        for ip in ips:
+            candidate = make_forti_public_ip_candidate(
+                family=family,
+                ip_value=ip,
+                source="ippool",
+                interface_name=interface_name,
+                role=role,
+                status=status,
+                object_name=pool_name,
+            )
+            if candidate:
+                candidates.append(candidate)
 
     return candidates
 
@@ -1338,11 +1625,13 @@ def build_forti_public_ip_candidates(interface_records: List[dict], family: int)
 def rank_forti_public_ip_candidate(
     candidate: dict,
     preferred_interfaces: Dict[str, int],
-) -> Tuple[int, int, int, int, str, str]:
+) -> Tuple[int, int, int, int, int, str, str]:
     interface_name = (candidate.get("interface") or "").strip().lower()
     role = (candidate.get("role") or "").strip().lower()
     status = (candidate.get("status") or "").strip().lower()
+    source = (candidate.get("source") or "").strip().lower()
 
+    source_rank = {"interface": 0, "vip": 1, "ippool": 2}.get(source, 3)
     scope_rank = 0 if candidate.get("is_global") else (1 if not candidate.get("is_private") else 2)
     preferred_rank = preferred_interfaces.get(interface_name, len(preferred_interfaces) + 1)
     role_rank = 0 if role == "wan" else 1
@@ -1350,6 +1639,7 @@ def rank_forti_public_ip_candidate(
 
     return (
         scope_rank,
+        source_rank,
         preferred_rank,
         role_rank,
         status_rank,
@@ -1359,11 +1649,9 @@ def rank_forti_public_ip_candidate(
 
 
 def list_forti_public_ip_candidates(
-    interface_records: List[dict],
+    candidates: List[dict],
     preferred_interfaces: List[str],
-    family: int,
 ) -> List[dict]:
-    candidates = build_forti_public_ip_candidates(interface_records, family)
     if not candidates:
         return []
 
@@ -1535,25 +1823,49 @@ def sync_forti_public_ip_to_netbox(nb) -> None:
 
     vdom = (env(FORTI_VDOM_ENV, "root") or "root").strip() or "root"
     preferred_interfaces = parse_forti_interface_names(env(FORTI_WAN_INTERFACES_ENV))
+    max_range = parse_forti_max_range_expansion()
 
     LOG.info("Syncing Forti public IPs (vdom=%s)", vdom)
     interface_records = collect_forti_interface_records(client, vdom)
-    if not interface_records:
-        LOG.warning("Skipping Forti public IP sync: no interface data returned by Forti API")
-        return
+    vip_records = collect_forti_vip_records(client, vdom)
+    ippool4_records = collect_forti_ippool_records(client, vdom, family=4)
+    ippool6_records = collect_forti_ippool_records(client, vdom, family=6)
 
-    public_v4_candidates = list_forti_public_ip_candidates(interface_records, preferred_interfaces, family=4)
-    public_v6_candidates = list_forti_public_ip_candidates(interface_records, preferred_interfaces, family=6)
+    if not interface_records:
+        LOG.warning("Forti interface data is empty; continuing with VIP/IP pool sources")
+
+    LOG.info(
+        "Forti source records: interfaces=%d vip=%d ippool=%d ippool6=%d",
+        len(interface_records),
+        len(vip_records),
+        len(ippool4_records),
+        len(ippool6_records),
+    )
+
+    all_v4_candidates: List[dict] = []
+    all_v4_candidates.extend(build_forti_interface_public_ip_candidates(interface_records, family=4))
+    all_v4_candidates.extend(build_forti_vip_public_ip_candidates(vip_records, family=4, max_range=max_range))
+    all_v4_candidates.extend(
+        build_forti_ippool_public_ip_candidates(ippool4_records, family=4, max_range=max_range)
+    )
+
+    all_v6_candidates: List[dict] = []
+    all_v6_candidates.extend(build_forti_interface_public_ip_candidates(interface_records, family=6))
+    all_v6_candidates.extend(build_forti_vip_public_ip_candidates(vip_records, family=6, max_range=max_range))
+    all_v6_candidates.extend(
+        build_forti_ippool_public_ip_candidates(ippool6_records, family=6, max_range=max_range)
+    )
+
+    public_v4_candidates = list_forti_public_ip_candidates(all_v4_candidates, preferred_interfaces)
+    public_v6_candidates = list_forti_public_ip_candidates(all_v6_candidates, preferred_interfaces)
     if not public_v4_candidates and not public_v6_candidates:
-        all_v4 = build_forti_public_ip_candidates(interface_records, family=4)
-        all_v6 = build_forti_public_ip_candidates(interface_records, family=6)
-        if all_v4 or all_v6:
+        if all_v4_candidates or all_v6_candidates:
             LOG.warning(
-                "Skipping Forti public IP sync: interfaces returned IPs but none are globally routable"
+                "Skipping Forti public IP sync: Forti sources returned IPs but none are globally routable"
             )
         else:
             LOG.warning(
-                "Skipping Forti public IP sync: no usable IPv4 or IPv6 address found on Forti interfaces"
+                "Skipping Forti public IP sync: no usable IPv4 or IPv6 address found on interfaces/VIPs/IP pools"
             )
         return
 
@@ -1588,7 +1900,10 @@ def sync_forti_public_ip_to_netbox(nb) -> None:
 
         for candidate in candidates:
             selected_ip = candidate["ip"]
-            source_interface = normalize_text(candidate.get("interface")) or source_interface_default
+            source_interface = normalize_text(candidate.get("interface"))
+            if source_interface and source_interface.lower() in ("any", "all", "*"):
+                source_interface = None
+            source_interface = source_interface or source_interface_default
             target_interface = target_interface_override or source_interface
             cidr = f"{selected_ip}/{prefix}"
 
@@ -1637,9 +1952,11 @@ def sync_forti_public_ip_to_netbox(nb) -> None:
             if family not in synced_ip_objects:
                 synced_ip_objects[family] = ip_obj
             LOG.info(
-                "Forti public IPv%s %s (source interface=%s) synced to device %s interface %s",
+                "Forti public IPv%s %s (source=%s object=%s interface=%s) synced to device %s interface %s",
                 family,
                 cidr,
+                candidate.get("source") or "unknown",
+                candidate.get("object_name") or "-",
                 source_interface,
                 device.name,
                 target_interface,

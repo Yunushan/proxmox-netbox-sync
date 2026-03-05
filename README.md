@@ -90,6 +90,7 @@ pip install proxmoxer pynetbox requests
     - `PVE_FORTI_VDOM` (defaults to `root`)
     - `PVE_FORTI_TIMEOUT` (seconds, defaults to `20`)
     - `PVE_FORTI_WAN_INTERFACES` (optional preferred interface order, e.g. `wan1,wan2`)
+    - `PVE_FORTI_MAX_RANGE_EXPANSION` (defaults to `2048`; max addresses expanded per VIP/IP pool range object)
     - NetBox target options:
       - `NB_FORTI_DEVICE` (optional NetBox device name or numeric ID; if unset, script tries Forti hostname -> NetBox device name match)
       - `NB_FORTI_INTERFACE` (optional NetBox interface override; defaults to selected Forti interface name)
@@ -127,7 +128,8 @@ pip install proxmoxer pynetbox requests
 - **Forti public IP sync (IPv4/IPv6)**:
   - Enable with `PVE_FORTI_PUBLIC_IP_SYNC=true`.
   - Auth supports both token-based REST API admins and session-based users (for example `super_admin_readonly`).
-  - The script queries Forti interfaces, collects all globally routable public IPv4/IPv6 addresses, assigns them as `/32` and `/128` to the target NetBox device interface(s), and optionally updates `primary_ip4` / `primary_ip6` using the highest-ranked public address in each family.
+  - The script queries Forti interfaces, Virtual IPs (`firewall/vip`), and IP pools (`firewall/ippool`, `firewall/ippool6`), then collects globally routable public IPv4/IPv6 addresses.
+  - Synced addresses are assigned as `/32` and `/128` to the target NetBox device interface(s), and `primary_ip4` / `primary_ip6` can be updated using the highest-ranked public address in each family.
 
 - **Proxmox guest agent inside VMs**:
   - Install and enable `qemu-guest-agent` so IP discovery works. Without it, VMs are still synced but IPs remain empty.
