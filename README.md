@@ -1,12 +1,13 @@
 # Proxmox to NetBox Sync
 
-Sync Proxmox VE nodes, VMs, interfaces, VLANs, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, and VLANs are auto-created (optionally scoped to a site). Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field.
+Sync Proxmox VE nodes, VMs, interfaces, VLANs, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, and VLANs are auto-created (optionally scoped to a site). Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field. Optionally, the script can also read Forti public IPs (IPv4/IPv6) and sync them into a NetBox device interface.
 
 ## Requirements
 
 - Python 3.9+
 - Proxmox API token with permission to read nodes/VMs (create a dedicated `@pve` user + API token)
 - NetBox API token
+- Optional Forti API access (token or username/password) for public IP sync
 - `qemu-guest-agent` installed in VMs to collect IPs (recommended)
 - Python packages: `proxmoxer`, `pynetbox`, `requests`
 
@@ -78,6 +79,22 @@ pip install proxmoxer pynetbox requests
     - `PVE_NODE_ILO_DOMAIN_SUFFIXES` (optional comma/space list of extra DNS suffixes for auto `ilo-{node}` lookup; e.g. `example.com example.net example.org`)
     - `PVE_NODE_ILO_INTERFACE` (defaults to `iLO`)
     - `PVE_NODE_ILO_SET_PRIMARY` (defaults to `true`; updates device primary IP from iLO IP)
+  - Optional Forti public IP sync:
+    - `PVE_FORTI_PUBLIC_IP_SYNC` (optional bool; defaults to `false`)
+    - `PVE_FORTI_URL` (Forti base URL)
+    - Authentication options:
+      - REST API token mode: `PVE_FORTI_API_TOKEN` (recommended for `api-user` / REST API admin)
+      - Session login mode: `PVE_FORTI_USERNAME` + `PVE_FORTI_PASSWORD` (works with read-only admins such as `super_admin_readonly`)
+      - If both are set, token auth is tried first and session login is used as fallback on auth denial.
+    - `PVE_FORTI_VERIFY_SSL` (defaults to `false`)
+    - `PVE_FORTI_VDOM` (defaults to `root`)
+    - `PVE_FORTI_TIMEOUT` (seconds, defaults to `20`)
+    - `PVE_FORTI_WAN_INTERFACES` (optional preferred interface order, e.g. `wan1,wan2`)
+    - NetBox target options:
+      - `NB_FORTI_DEVICE` (optional NetBox device name or numeric ID; if unset, script tries Forti hostname -> NetBox device name match)
+      - `NB_FORTI_INTERFACE` (optional NetBox interface override; defaults to selected Forti interface name)
+      - `NB_FORTI_SET_PRIMARY` (defaults to `true`; updates device `primary_ip4`)
+      - `NB_FORTI_SET_PRIMARY6` (defaults to `true`; updates device `primary_ip6`)
 
 ### Sync modes
 
@@ -106,6 +123,11 @@ pip install proxmoxer pynetbox requests
   - Enabled by default. The script resolves one iLO/OOB address per Proxmox node, creates/uses a NetBox device interface (default name `iLO`), assigns the IP to that interface, and optionally sets `primary_ip4` / `primary_ip6`.
   - Host resolution order: `PVE_NODE_ILO_MAP` -> NPM `ilo-*` discovery (`PVE_NODE_ILO_NPM_*`) -> `PVE_NODE_ILO_TEMPLATE` -> `PVE_NODE_ILO_PREFIX` + `{node}` + `PVE_NODE_ILO_SUFFIX` -> automatic DNS discovery across multiple domain suffixes (`ilo-{node}.<suffix>` from resolver search domains, `PVE_HOST`/node host settings, and `PVE_NODE_ILO_DOMAIN_SUFFIXES`) -> `ilo-{node}`.
   - Hostnames are DNS-resolved and stored as `/32` (IPv4) or `/128` (IPv6) IP addresses.
+
+- **Forti public IP sync (IPv4/IPv6)**:
+  - Enable with `PVE_FORTI_PUBLIC_IP_SYNC=true`.
+  - Auth supports both token-based REST API admins and session-based users (for example `super_admin_readonly`).
+  - The script queries Forti interfaces, collects all globally routable public IPv4/IPv6 addresses, assigns them as `/32` and `/128` to the target NetBox device interface(s), and optionally updates `primary_ip4` / `primary_ip6` using the highest-ranked public address in each family.
 
 - **Proxmox guest agent inside VMs**:
   - Install and enable `qemu-guest-agent` so IP discovery works. Without it, VMs are still synced but IPs remain empty.

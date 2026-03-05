@@ -25,6 +25,17 @@ export PVE_NODE_ILO_DOMAIN_SUFFIXES="" # Optional extra DNS suffixes (comma/spac
 export PVE_NODE_ILO_INTERFACE="iLO"   # Optional NetBox interface name for node management IP
 export PVE_NODE_ILO_SET_PRIMARY="true" # Set node primary_ip4/primary_ip6 from resolved iLO IP
 
+# Optional Forti public IP sync (disabled by default)
+export PVE_FORTI_PUBLIC_IP_SYNC="false" # Optional bool. true => sync Forti public IPv4/IPv6 to NetBox.
+export PVE_FORTI_URL=""                 # Forti base URL (e.g. "https://forti.example.net")
+export PVE_FORTI_API_TOKEN=""           # Preferred auth for REST API admin users
+export PVE_FORTI_USERNAME=""            # Optional session auth user (e.g. super_admin_readonly)
+export PVE_FORTI_PASSWORD=""            # Optional session auth password
+export PVE_FORTI_VERIFY_SSL="false"     # Verify Forti TLS certificate
+export PVE_FORTI_VDOM="root"            # Forti VDOM to query
+export PVE_FORTI_TIMEOUT="20"           # Forti API timeout in seconds
+export PVE_FORTI_WAN_INTERFACES=""      # Optional preferred WAN interfaces (e.g. "wan1,wan2")
+
 # Netbox
 export NB_URL="https://netbox.example.com"   # NetBox base URL
 export NB_TOKEN="YOUR_NETBOX_TOKEN"          # NetBox API token
@@ -43,6 +54,10 @@ export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slu
 export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices)
 export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
 export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
+export NB_FORTI_DEVICE=""                    # Optional NetBox Forti device name or ID (defaults to Forti hostname)
+export NB_FORTI_INTERFACE=""                 # Optional NetBox interface override (defaults to selected Forti interface)
+export NB_FORTI_SET_PRIMARY="true"           # Set Forti device primary_ip4 from synced public IPv4
+export NB_FORTI_SET_PRIMARY6="true"          # Set Forti device primary_ip6 from synced public IPv6
 export NB_VM_POOL_CF="pool"                  # Optional VM custom field key for Proxmox pool
 export NB_VM_GW4_CF="gateway4"               # Optional VM custom field key for IPv4 gateway (set empty to disable)
 export NB_VM_GW6_CF="gateway6"               # Optional VM custom field key for IPv6 gateway (set empty to disable)

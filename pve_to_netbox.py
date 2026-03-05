@@ -345,6 +345,19 @@ NODE_ILO_DOMAIN_SUFFIXES_ENV = "PVE_NODE_ILO_DOMAIN_SUFFIXES"
 IP_BLOCK_REPORT_ENV = "PVE_NB_IP_BLOCK_REPORT"
 IP_BLOCK_REPORT_PATH_ENV = "PVE_NB_IP_BLOCK_REPORT_PATH"
 PVE_API_TIMEOUT_ENV = "PVE_API_TIMEOUT"
+FORTI_PUBLIC_IP_SYNC_ENV = "PVE_FORTI_PUBLIC_IP_SYNC"
+FORTI_URL_ENV = "PVE_FORTI_URL"
+FORTI_API_TOKEN_ENV = "PVE_FORTI_API_TOKEN"
+FORTI_USERNAME_ENV = "PVE_FORTI_USERNAME"
+FORTI_PASSWORD_ENV = "PVE_FORTI_PASSWORD"
+FORTI_VERIFY_SSL_ENV = "PVE_FORTI_VERIFY_SSL"
+FORTI_VDOM_ENV = "PVE_FORTI_VDOM"
+FORTI_TIMEOUT_ENV = "PVE_FORTI_TIMEOUT"
+FORTI_WAN_INTERFACES_ENV = "PVE_FORTI_WAN_INTERFACES"
+NB_FORTI_DEVICE_ENV = "NB_FORTI_DEVICE"
+NB_FORTI_INTERFACE_ENV = "NB_FORTI_INTERFACE"
+NB_FORTI_SET_PRIMARY_ENV = "NB_FORTI_SET_PRIMARY"
+NB_FORTI_SET_PRIMARY6_ENV = "NB_FORTI_SET_PRIMARY6"
 
 
 def parse_sync_mode(value: str) -> str:
@@ -875,6 +888,788 @@ def has_explicit_node_ilo_mapping() -> bool:
             NODE_ILO_DOMAIN_SUFFIXES_ENV,
         )
     )
+
+
+FORTI_IPV4_RE = re.compile(
+    r"\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b"
+)
+
+
+class FortiAPIError(RuntimeError):
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def forti_error_status_code(exc: Exception) -> Optional[int]:
+    if isinstance(exc, FortiAPIError):
+        return exc.status_code
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        return parse_int(getattr(response, "status_code", None))
+    return None
+
+
+def should_sync_forti_public_ip() -> bool:
+    enabled = parse_bool(env(FORTI_PUBLIC_IP_SYNC_ENV, "false"))
+    return bool(enabled)
+
+
+def parse_forti_interface_names(raw_value: Optional[str]) -> List[str]:
+    if not raw_value:
+        return []
+    values = [chunk.strip().lower() for chunk in re.split(r"[,\s;]+", raw_value) if chunk.strip()]
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def parse_forti_result_items(payload: object) -> List[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        for key in ("results", "result", "items", "data", "interfaces", "entries"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = parse_forti_result_items(value)
+                if nested:
+                    return nested
+                if any(k in value for k in ("name", "interface", "ifname")):
+                    return [value]
+
+        if any(k in payload for k in ("name", "interface", "ifname")):
+            return [payload]
+
+    return []
+
+
+def build_forti_api_client() -> Optional[dict]:
+    base_url = (env(FORTI_URL_ENV, "") or "").strip().rstrip("/")
+    if not base_url:
+        LOG.warning(
+            "Skipping Forti public IP sync: %s is enabled but %s is empty",
+            FORTI_PUBLIC_IP_SYNC_ENV,
+            FORTI_URL_ENV,
+        )
+        return None
+
+    verify = parse_bool(env(FORTI_VERIFY_SSL_ENV, "false"))
+    if verify is None:
+        verify = False
+
+    timeout_s = parse_int(env(FORTI_TIMEOUT_ENV, "20"))
+    if timeout_s is None or timeout_s <= 0:
+        timeout_s = 20
+
+    token = normalize_text(env(FORTI_API_TOKEN_ENV))
+    username = normalize_text(env(FORTI_USERNAME_ENV))
+    password = env(FORTI_PASSWORD_ENV)
+    password_text = normalize_text(password)
+
+    strategies: List[str] = []
+    if token:
+        strategies.extend(["token_header", "token_query"])
+    if username and password_text:
+        strategies.append("session")
+
+    if not strategies:
+        LOG.warning(
+            "Skipping Forti public IP sync: set %s or %s+%s",
+            FORTI_API_TOKEN_ENV,
+            FORTI_USERNAME_ENV,
+            FORTI_PASSWORD_ENV,
+        )
+        return None
+
+    session = requests.Session()
+    session.verify = verify
+    return {
+        "base_url": base_url,
+        "timeout": timeout_s,
+        "token": token,
+        "username": username,
+        "password": password_text,
+        "session": session,
+        "strategies": strategies,
+        "active_strategy": None,
+        "session_logged_in": False,
+    }
+
+
+def forti_api_login_with_session(client: dict) -> None:
+    if client.get("session_logged_in"):
+        return
+
+    username = client.get("username")
+    password = client.get("password")
+    if not username or not password:
+        raise FortiAPIError("Forti username/password are not configured for session login")
+
+    session = client["session"]
+    timeout_s = client["timeout"]
+    url = f"{client['base_url']}/logincheck"
+    response = session.post(
+        url,
+        data={"username": username, "secretkey": password, "ajax": "1"},
+        timeout=timeout_s,
+    )
+    if response.status_code >= 400:
+        raise FortiAPIError(
+            f"Forti login failed with HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
+
+    body = (response.text or "").strip().lower()
+    if body and not body.startswith("1") and "success" not in body:
+        raise FortiAPIError(
+            "Forti logincheck did not return success",
+            status_code=response.status_code,
+        )
+
+    csrf = session.cookies.get("ccsrftoken")
+    if csrf:
+        session.headers.update({"X-CSRFTOKEN": csrf.strip('"')})
+
+    client["session_logged_in"] = True
+
+
+def forti_api_get_with_strategy(
+    client: dict,
+    path: str,
+    params: Optional[dict],
+    strategy: str,
+) -> object:
+    session = client["session"]
+    timeout_s = client["timeout"]
+    url = f"{client['base_url']}{path}"
+    query = dict(params or {})
+    headers: Dict[str, str] = {}
+
+    if strategy == "token_header":
+        token = client.get("token")
+        if not token:
+            raise FortiAPIError("Forti token is not configured for bearer authentication")
+        headers["Authorization"] = f"Bearer {token}"
+    elif strategy == "token_query":
+        token = client.get("token")
+        if not token:
+            raise FortiAPIError("Forti token is not configured for query authentication")
+        query["access_token"] = token
+    elif strategy == "session":
+        forti_api_login_with_session(client)
+    else:
+        raise FortiAPIError(f"Unsupported Forti auth strategy: {strategy}")
+
+    response = session.get(url, params=query, headers=headers or None, timeout=timeout_s)
+    if response.status_code in (401, 403):
+        raise FortiAPIError(
+            f"Forti authentication rejected request ({response.status_code})",
+            status_code=response.status_code,
+        )
+    if response.status_code >= 400:
+        raise FortiAPIError(
+            f"Forti API request failed with HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise FortiAPIError(
+            f"Forti API did not return JSON for {path}",
+            status_code=response.status_code,
+        ) from exc
+
+    if isinstance(payload, dict):
+        status_raw = str(payload.get("status", "")).strip().lower()
+        if status_raw == "error":
+            http_status = parse_int(payload.get("http_status"))
+            error_detail = (
+                payload.get("message")
+                or payload.get("error")
+                or payload.get("error_msg")
+                or payload.get("status")
+                or "unknown error"
+            )
+            raise FortiAPIError(
+                f"Forti API error on {path}: {error_detail}",
+                status_code=http_status or response.status_code,
+            )
+
+    return payload
+
+
+def forti_api_get_json(client: dict, path: str, params: Optional[dict] = None) -> object:
+    strategies: List[str] = list(client.get("strategies") or [])
+    active = client.get("active_strategy")
+
+    attempts: List[str] = []
+    if active:
+        attempts.append(active)
+    for strategy in strategies:
+        if strategy not in attempts:
+            attempts.append(strategy)
+
+    if not attempts:
+        raise FortiAPIError("No Forti authentication strategies available")
+
+    last_exc: Optional[Exception] = None
+    for strategy in attempts:
+        try:
+            payload = forti_api_get_with_strategy(client, path, params, strategy)
+            client["active_strategy"] = strategy
+            return payload
+        except Exception as exc:
+            last_exc = exc
+            status = forti_error_status_code(exc)
+            if status in (401, 403):
+                LOG.debug("Forti auth strategy '%s' failed with HTTP %s", strategy, status)
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    raise FortiAPIError(f"Forti API request failed for {path}")
+
+
+def parse_ip_values(raw_value: Optional[object], family: int) -> List[str]:
+    values: List[str] = []
+    seen: Set[str] = set()
+    expected_type = ipaddress.IPv4Address if family == 4 else ipaddress.IPv6Address
+
+    def add_ip(value: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        if not isinstance(addr, expected_type):
+            return False
+        if addr.is_unspecified:
+            return False
+        text = str(addr)
+        if text in seen:
+            return True
+        seen.add(text)
+        values.append(text)
+        return True
+
+    def walk(value: Optional[object]) -> None:
+        if value is None:
+            return
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return
+            tokens = re.split(r"[\s,;]+", text)
+            for token in tokens:
+                candidate = token.strip().strip("\"'[](){}")
+                if not candidate:
+                    continue
+                if "=" in candidate and candidate.count("=") == 1:
+                    key, val = candidate.split("=", 1)
+                    key_text = key.strip().lower()
+                    if "ip" in key_text or "addr" in key_text:
+                        candidate = val
+                candidate = candidate.strip().strip("\"'[](){}")
+                if not candidate:
+                    continue
+                if "/" in candidate:
+                    candidate = candidate.split("/", 1)[0]
+                add_ip(candidate)
+
+            if family == 4:
+                for match in FORTI_IPV4_RE.findall(text):
+                    add_ip(match)
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk(item)
+            return
+
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key).lower()
+                if "ip" not in key_text and "addr" not in key_text:
+                    continue
+                walk(nested)
+            return
+
+        walk(str(value))
+
+    walk(raw_value)
+    return values
+
+
+def extract_forti_interface_ips(interface: dict, family: int) -> List[str]:
+    values: List[str] = []
+    seen: Set[str] = set()
+
+    def append_many(items: List[str]) -> None:
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            values.append(item)
+
+    if family == 4:
+        explicit_keys = (
+            "ip",
+            "ipv4",
+            "ipv4-address",
+            "ipv4_address",
+            "public-ip",
+            "public_ip",
+            "dynamic_ip",
+            "secondaryip",
+            "secondary_ip",
+        )
+    else:
+        explicit_keys = (
+            "ip6",
+            "ip6-address",
+            "ip6_address",
+            "ipv6",
+            "ipv6-address",
+            "ipv6_address",
+            "public-ipv6",
+            "public_ipv6",
+            "secondaryip6",
+            "secondary_ip6",
+            "secondary-ipv6",
+            "secondary_ipv6",
+        )
+
+    for key in explicit_keys:
+        if key in interface:
+            append_many(parse_ip_values(interface.get(key), family))
+
+    if not values:
+        for key, raw_value in interface.items():
+            key_text = str(key).lower()
+            if "ip" not in key_text and "addr" not in key_text:
+                continue
+            append_many(parse_ip_values(raw_value, family))
+
+    return values
+
+
+def collect_forti_interface_records(client: dict, vdom: str) -> List[dict]:
+    requests_to_try = [
+        (
+            "/api/v2/monitor/system/interface",
+            {"vdom": vdom},
+        ),
+        (
+            "/api/v2/cmdb/system/interface",
+            {"vdom": vdom, "format": "name|ip|role|status|mode|secondaryip"},
+        ),
+    ]
+
+    for path, params in requests_to_try:
+        try:
+            payload = forti_api_get_json(client, path, params)
+            records = parse_forti_result_items(payload)
+            if records:
+                return records
+        except Exception as exc:
+            LOG.warning("Forti interface query failed for %s: %s", path, exc)
+
+    return []
+
+
+def build_forti_public_ip_candidates(interface_records: List[dict], family: int) -> List[dict]:
+    candidates: List[dict] = []
+    for record in interface_records:
+        if not isinstance(record, dict):
+            continue
+
+        interface_name = normalize_text(
+            record.get("name")
+            or record.get("interface")
+            or record.get("ifname")
+            or record.get("interface-name")
+        )
+        role = normalize_choice_value(record.get("role"))
+        status = normalize_choice_value(record.get("status") or record.get("link"))
+        for ip in extract_forti_interface_ips(record, family):
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if family == 4 and not isinstance(addr, ipaddress.IPv4Address):
+                continue
+            if family == 6 and not isinstance(addr, ipaddress.IPv6Address):
+                continue
+            if (
+                addr.is_unspecified
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_multicast
+                or addr.is_reserved
+            ):
+                continue
+
+            candidates.append(
+                {
+                    "family": family,
+                    "interface": interface_name or "",
+                    "role": role or "",
+                    "status": status or "",
+                    "ip": str(addr),
+                    "is_global": bool(addr.is_global),
+                    "is_private": bool(addr.is_private),
+                }
+            )
+
+    return candidates
+
+
+def rank_forti_public_ip_candidate(
+    candidate: dict,
+    preferred_interfaces: Dict[str, int],
+) -> Tuple[int, int, int, int, str, str]:
+    interface_name = (candidate.get("interface") or "").strip().lower()
+    role = (candidate.get("role") or "").strip().lower()
+    status = (candidate.get("status") or "").strip().lower()
+
+    scope_rank = 0 if candidate.get("is_global") else (1 if not candidate.get("is_private") else 2)
+    preferred_rank = preferred_interfaces.get(interface_name, len(preferred_interfaces) + 1)
+    role_rank = 0 if role == "wan" else 1
+    status_rank = 0 if status in ("up", "enable", "enabled", "online", "link-up") else 1
+
+    return (
+        scope_rank,
+        preferred_rank,
+        role_rank,
+        status_rank,
+        interface_name,
+        candidate.get("ip", ""),
+    )
+
+
+def list_forti_public_ip_candidates(
+    interface_records: List[dict],
+    preferred_interfaces: List[str],
+    family: int,
+) -> List[dict]:
+    candidates = build_forti_public_ip_candidates(interface_records, family)
+    if not candidates:
+        return []
+
+    preferred_map = {name.lower(): idx for idx, name in enumerate(preferred_interfaces)}
+    public_candidates = [item for item in candidates if item.get("is_global")]
+    if not public_candidates:
+        return []
+
+    # The same public IP may appear more than once in Forti output; keep the best-ranked source.
+    best_by_ip: Dict[str, dict] = {}
+    for candidate in public_candidates:
+        ip_value = normalize_text(candidate.get("ip"))
+        if not ip_value:
+            continue
+        current = best_by_ip.get(ip_value)
+        if not current:
+            best_by_ip[ip_value] = candidate
+            continue
+        if rank_forti_public_ip_candidate(candidate, preferred_map) < rank_forti_public_ip_candidate(
+            current,
+            preferred_map,
+        ):
+            best_by_ip[ip_value] = candidate
+
+    ranked = list(best_by_ip.values())
+    ranked.sort(key=lambda item: rank_forti_public_ip_candidate(item, preferred_map))
+    return ranked
+
+
+def fetch_forti_hostname(client: dict, vdom: str) -> Optional[str]:
+    try:
+        payload = forti_api_get_json(client, "/api/v2/monitor/system/status", {"vdom": vdom})
+    except Exception as exc:
+        LOG.debug("Forti hostname query failed: %s", exc)
+        return None
+
+    records: List[dict] = []
+    if isinstance(payload, dict):
+        records.append(payload)
+        for key in ("results", "result", "data"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                records.append(value)
+            elif isinstance(value, list):
+                records.extend(item for item in value if isinstance(item, dict))
+
+    for record in records:
+        for key in ("hostname", "host-name", "name"):
+            host = normalize_text(record.get(key))
+            if host:
+                return host
+
+    return None
+
+
+def find_netbox_device_by_identifier(nb, identifier: str):
+    lookup = normalize_text(identifier)
+    if not lookup:
+        return None
+
+    device_id = parse_int(lookup)
+    if device_id is not None:
+        device = nb.dcim.devices.get(id=device_id)
+        if device:
+            return device
+
+    device = nb.dcim.devices.get(name=lookup)
+    if device:
+        return device
+
+    matches = list(nb.dcim.devices.filter(q=lookup))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        LOG.warning("NetBox device lookup '%s' is ambiguous (%d matches)", lookup, len(matches))
+    return None
+
+
+def resolve_forti_netbox_device(nb, client: dict, vdom: str):
+    configured = normalize_text(env(NB_FORTI_DEVICE_ENV))
+    if configured:
+        device = find_netbox_device_by_identifier(nb, configured)
+        if not device:
+            LOG.warning("Configured Forti NetBox device '%s' was not found", configured)
+        return device
+
+    forti_hostname = fetch_forti_hostname(client, vdom)
+    if not forti_hostname:
+        LOG.warning(
+            "Forti hostname lookup failed; set %s to choose the NetBox target device",
+            NB_FORTI_DEVICE_ENV,
+        )
+        return None
+
+    device = find_netbox_device_by_identifier(nb, forti_hostname)
+    if not device:
+        LOG.warning(
+            "NetBox device matching Forti hostname '%s' was not found (set %s to override)",
+            forti_hostname,
+            NB_FORTI_DEVICE_ENV,
+        )
+    return device
+
+
+def ensure_forti_device_interface(nb, device, iface_name: str):
+    iface = nb.dcim.interfaces.get(device_id=device.id, name=iface_name)
+    if iface:
+        return iface
+
+    LOG.info("Creating NetBox device interface %s on Forti device %s", iface_name, device.name)
+    payloads = [
+        {
+            "name": iface_name,
+            "device": device.id,
+            "type": "virtual",
+            "enabled": True,
+        },
+        {
+            "name": iface_name,
+            "device": device.id,
+            "type": "other",
+            "enabled": True,
+        },
+        {
+            "name": iface_name,
+            "device": device.id,
+            "enabled": True,
+        },
+    ]
+
+    last_exc: Optional[Exception] = None
+    for payload in payloads:
+        try:
+            return nb.dcim.interfaces.create(payload)
+        except RequestError as exc:
+            last_exc = exc
+            LOG.debug(
+                "Failed to create Forti interface %s on %s with payload keys=%s: %s",
+                iface_name,
+                device.name,
+                ",".join(payload.keys()),
+                exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            LOG.debug(
+                "Unexpected failure while creating Forti interface %s on %s: %s",
+                iface_name,
+                device.name,
+                exc,
+            )
+
+    iface = nb.dcim.interfaces.get(device_id=device.id, name=iface_name)
+    if iface:
+        return iface
+
+    if last_exc:
+        raise last_exc
+    return None
+
+
+def sync_forti_public_ip_to_netbox(nb) -> None:
+    if not should_sync_forti_public_ip():
+        return
+
+    client = build_forti_api_client()
+    if not client:
+        return
+
+    vdom = (env(FORTI_VDOM_ENV, "root") or "root").strip() or "root"
+    preferred_interfaces = parse_forti_interface_names(env(FORTI_WAN_INTERFACES_ENV))
+
+    LOG.info("Syncing Forti public IPs (vdom=%s)", vdom)
+    interface_records = collect_forti_interface_records(client, vdom)
+    if not interface_records:
+        LOG.warning("Skipping Forti public IP sync: no interface data returned by Forti API")
+        return
+
+    public_v4_candidates = list_forti_public_ip_candidates(interface_records, preferred_interfaces, family=4)
+    public_v6_candidates = list_forti_public_ip_candidates(interface_records, preferred_interfaces, family=6)
+    if not public_v4_candidates and not public_v6_candidates:
+        all_v4 = build_forti_public_ip_candidates(interface_records, family=4)
+        all_v6 = build_forti_public_ip_candidates(interface_records, family=6)
+        if all_v4 or all_v6:
+            LOG.warning(
+                "Skipping Forti public IP sync: interfaces returned IPs but none are globally routable"
+            )
+        else:
+            LOG.warning(
+                "Skipping Forti public IP sync: no usable IPv4 or IPv6 address found on Forti interfaces"
+            )
+        return
+
+    LOG.info(
+        "Forti public IP candidates: IPv4=%d IPv6=%d",
+        len(public_v4_candidates),
+        len(public_v6_candidates),
+    )
+
+    device = resolve_forti_netbox_device(nb, client, vdom)
+    if not device:
+        return
+
+    target_interface_override = normalize_text(env(NB_FORTI_INTERFACE_ENV))
+    set_primary_v4 = parse_bool(env(NB_FORTI_SET_PRIMARY_ENV, "true"))
+    if set_primary_v4 is None:
+        set_primary_v4 = True
+    set_primary_v6 = parse_bool(env(NB_FORTI_SET_PRIMARY6_ENV, str(set_primary_v4).lower()))
+    if set_primary_v6 is None:
+        set_primary_v6 = set_primary_v4
+
+    iface_cache: Dict[str, object] = {}
+    synced_ip_objects: Dict[int, object] = {}
+    candidates_by_family = (
+        (4, public_v4_candidates),
+        (6, public_v6_candidates),
+    )
+
+    for family, candidates in candidates_by_family:
+        source_interface_default = "wan6" if family == 6 else "wan"
+        prefix = 128 if family == 6 else 32
+
+        for candidate in candidates:
+            selected_ip = candidate["ip"]
+            source_interface = normalize_text(candidate.get("interface")) or source_interface_default
+            target_interface = target_interface_override or source_interface
+            cidr = f"{selected_ip}/{prefix}"
+
+            iface = iface_cache.get(target_interface)
+            if not iface:
+                try:
+                    iface = ensure_forti_device_interface(nb, device, target_interface)
+                except RequestError as exc:
+                    LOG.error(
+                        "Forti public IP sync failed while ensuring interface %s on %s: %s",
+                        target_interface,
+                        device.name,
+                        exc,
+                    )
+                    continue
+                except Exception as exc:
+                    LOG.error(
+                        "Unexpected Forti public IP sync failure while ensuring interface %s on %s: %s",
+                        target_interface,
+                        device.name,
+                        exc,
+                    )
+                    continue
+
+                if not iface:
+                    LOG.warning(
+                        "Skipping Forti public IP assignment: could not ensure interface %s on device %s",
+                        target_interface,
+                        device.name,
+                    )
+                    continue
+                iface_cache[target_interface] = iface
+
+            try:
+                ip_obj = ensure_node_ilo_ip_address(nb, iface, cidr)
+            except RequestError as exc:
+                LOG.error("Forti public IP sync failed while assigning %s: %s", cidr, exc)
+                continue
+            except Exception as exc:
+                LOG.error("Unexpected Forti public IP sync failure while assigning %s: %s", cidr, exc)
+                continue
+
+            if not ip_obj:
+                continue
+
+            if family not in synced_ip_objects:
+                synced_ip_objects[family] = ip_obj
+            LOG.info(
+                "Forti public IPv%s %s (source interface=%s) synced to device %s interface %s",
+                family,
+                cidr,
+                source_interface,
+                device.name,
+                target_interface,
+            )
+
+    if not synced_ip_objects:
+        return
+
+    need_save = False
+    if set_primary_v4:
+        ip_obj_v4 = synced_ip_objects.get(4)
+        if ip_obj_v4:
+            current_v4 = getattr(getattr(device, "primary_ip4", None), "id", None)
+            if current_v4 != ip_obj_v4.id:
+                device.primary_ip4 = ip_obj_v4
+                need_save = True
+
+    if set_primary_v6:
+        ip_obj_v6 = synced_ip_objects.get(6)
+        if ip_obj_v6:
+            current_v6 = getattr(getattr(device, "primary_ip6", None), "id", None)
+            if current_v6 != ip_obj_v6.id:
+                device.primary_ip6 = ip_obj_v6
+                need_save = True
+
+    if need_save:
+        save_netbox_object_with_retry(
+            device,
+            f"updating primary IPs for Forti device {device.name}",
+        )
 
 
 @lru_cache(maxsize=None)
@@ -4511,6 +5306,7 @@ def main():
     vmid_map = map_netbox_vms_by_vmid(nb, cluster)
     node_devices = ensure_node_devices(nb, proxmox, site, role, dtype, cluster)
     sync_node_ilo_addresses(nb, node_devices)
+    sync_forti_public_ip_to_netbox(nb)
     synced_vm_names, synced_vm_ids, failed_nodes = sync_vms(
         nb,
         proxmox,
