@@ -912,6 +912,15 @@ def forti_error_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def is_forti_auth_error(exc: Exception) -> bool:
+    status = forti_error_status_code(exc)
+    if status in (401, 403):
+        return True
+
+    message = str(exc).strip().lower()
+    return "logincheck" in message or "authentication rejected" in message
+
+
 def should_sync_forti_public_ip() -> bool:
     enabled = parse_bool(env(FORTI_PUBLIC_IP_SYNC_ENV, "false"))
     return bool(enabled)
@@ -1032,8 +1041,12 @@ def forti_api_login_with_session(client: dict) -> None:
     body = (response.text or "").strip().lower()
     if body and not body.startswith("1") and "success" not in body:
         raise FortiAPIError(
-            "Forti logincheck did not return success",
-            status_code=response.status_code,
+            (
+                "Forti session logincheck rejected the configured username/password. "
+                f"Verify {FORTI_USERNAME_ENV}/{FORTI_PASSWORD_ENV}, trusted-host restrictions, "
+                f"or set {FORTI_API_TOKEN_ENV} for token-based REST API access."
+            ),
+            status_code=401,
         )
 
     csrf = session.cookies.get("ccsrftoken")
@@ -1284,6 +1297,8 @@ def collect_forti_interface_records(client: dict, vdom: str) -> List[dict]:
             if records:
                 return records
         except Exception as exc:
+            if is_forti_auth_error(exc):
+                raise
             LOG.warning("Forti interface query failed for %s: %s", path, exc)
 
     return []
@@ -1298,6 +1313,8 @@ def collect_forti_vip_records(client: dict, vdom: str) -> List[dict]:
         )
         return parse_forti_result_items(payload)
     except Exception as exc:
+        if is_forti_auth_error(exc):
+            raise
         LOG.warning("Forti VIP query failed for /api/v2/cmdb/firewall/vip: %s", exc)
         return []
 
@@ -1318,6 +1335,8 @@ def collect_forti_ippool_records(client: dict, vdom: str, family: int) -> List[d
         )
         return parse_forti_result_items(payload)
     except Exception as exc:
+        if is_forti_auth_error(exc):
+            raise
         LOG.warning("Forti IP pool query failed for %s: %s", path, exc)
         return []
 
@@ -1826,10 +1845,16 @@ def sync_forti_public_ip_to_netbox(nb) -> None:
     max_range = parse_forti_max_range_expansion()
 
     LOG.info("Syncing Forti public IPs (vdom=%s)", vdom)
-    interface_records = collect_forti_interface_records(client, vdom)
-    vip_records = collect_forti_vip_records(client, vdom)
-    ippool4_records = collect_forti_ippool_records(client, vdom, family=4)
-    ippool6_records = collect_forti_ippool_records(client, vdom, family=6)
+    try:
+        interface_records = collect_forti_interface_records(client, vdom)
+        vip_records = collect_forti_vip_records(client, vdom)
+        ippool4_records = collect_forti_ippool_records(client, vdom, family=4)
+        ippool6_records = collect_forti_ippool_records(client, vdom, family=6)
+    except Exception as exc:
+        if is_forti_auth_error(exc):
+            LOG.error("Skipping Forti public IP sync: authentication failed: %s", exc)
+            return
+        raise
 
     if not interface_records:
         LOG.warning("Forti interface data is empty; continuing with VIP/IP pool sources")

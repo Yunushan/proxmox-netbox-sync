@@ -83,8 +83,8 @@ pip install proxmoxer pynetbox requests
     - `PVE_FORTI_PUBLIC_IP_SYNC` (optional bool; defaults to `false`)
     - `PVE_FORTI_URL` (Forti base URL)
     - Authentication options:
-      - REST API token mode: `PVE_FORTI_API_TOKEN` (recommended for `api-user` / REST API admin)
-      - Session login mode: `PVE_FORTI_USERNAME` + `PVE_FORTI_PASSWORD` (works with read-only admins such as `super_admin_readonly`)
+      - REST API token mode: `PVE_FORTI_API_TOKEN` (recommended for `api-user` / REST API admin, and required when FortiOS rejects session API login)
+      - Session login mode: `PVE_FORTI_USERNAME` + `PVE_FORTI_PASSWORD` (works on FortiOS builds that still allow `/logincheck`-based API sessions)
       - If both are set, token auth is tried first and session login is used as fallback on auth denial.
     - `PVE_FORTI_VERIFY_SSL` (defaults to `false`)
     - `PVE_FORTI_VDOM` (defaults to `root`)

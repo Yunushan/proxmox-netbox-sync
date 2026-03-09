@@ -28,8 +28,8 @@ export PVE_NODE_ILO_SET_PRIMARY="true" # Set node primary_ip4/primary_ip6 from r
 # Optional Forti public IP sync (disabled by default)
 export PVE_FORTI_PUBLIC_IP_SYNC="false" # Optional bool. true => sync public IPv4/IPv6 from Forti interfaces, VIPs, and IP pools.
 export PVE_FORTI_URL=""                 # Forti base URL (e.g. "https://forti.example.net")
-export PVE_FORTI_API_TOKEN=""           # Preferred auth for REST API admin users
-export PVE_FORTI_USERNAME=""            # Optional session auth user (e.g. super_admin_readonly)
+export PVE_FORTI_API_TOKEN=""           # Preferred auth for REST API admin users; use this when FortiOS rejects session API login
+export PVE_FORTI_USERNAME=""            # Optional session auth user (older FortiOS / logincheck-enabled API sessions)
 export PVE_FORTI_PASSWORD=""            # Optional session auth password
 export PVE_FORTI_VERIFY_SSL="false"     # Verify Forti TLS certificate
 export PVE_FORTI_VDOM="root"            # Forti VDOM to query
