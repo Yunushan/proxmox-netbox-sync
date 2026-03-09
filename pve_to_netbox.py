@@ -921,6 +921,19 @@ def is_forti_auth_error(exc: Exception) -> bool:
     return "logincheck" in message or "authentication rejected" in message
 
 
+def is_forti_unauthorized(exc: Exception) -> bool:
+    status = forti_error_status_code(exc)
+    if status == 401:
+        return True
+
+    message = str(exc).strip().lower()
+    return "logincheck" in message or "authentication rejected" in message
+
+
+def is_forti_forbidden(exc: Exception) -> bool:
+    return forti_error_status_code(exc) == 403
+
+
 def should_sync_forti_public_ip() -> bool:
     enabled = parse_bool(env(FORTI_PUBLIC_IP_SYNC_ENV, "false"))
     return bool(enabled)
@@ -1145,7 +1158,7 @@ def forti_api_get_json(client: dict, path: str, params: Optional[dict] = None) -
         except Exception as exc:
             last_exc = exc
             status = forti_error_status_code(exc)
-            if status in (401, 403):
+            if status == 401:
                 LOG.debug("Forti auth strategy '%s' failed with HTTP %s", strategy, status)
                 continue
             raise
@@ -1297,8 +1310,11 @@ def collect_forti_interface_records(client: dict, vdom: str) -> List[dict]:
             if records:
                 return records
         except Exception as exc:
-            if is_forti_auth_error(exc):
+            if is_forti_unauthorized(exc):
                 raise
+            if is_forti_forbidden(exc):
+                LOG.warning("Forti interface query forbidden for %s: %s", path, exc)
+                continue
             LOG.warning("Forti interface query failed for %s: %s", path, exc)
 
     return []
@@ -1313,8 +1329,11 @@ def collect_forti_vip_records(client: dict, vdom: str) -> List[dict]:
         )
         return parse_forti_result_items(payload)
     except Exception as exc:
-        if is_forti_auth_error(exc):
+        if is_forti_unauthorized(exc):
             raise
+        if is_forti_forbidden(exc):
+            LOG.warning("Forti VIP query forbidden for /api/v2/cmdb/firewall/vip: %s", exc)
+            return []
         LOG.warning("Forti VIP query failed for /api/v2/cmdb/firewall/vip: %s", exc)
         return []
 
@@ -1335,8 +1354,11 @@ def collect_forti_ippool_records(client: dict, vdom: str, family: int) -> List[d
         )
         return parse_forti_result_items(payload)
     except Exception as exc:
-        if is_forti_auth_error(exc):
+        if is_forti_unauthorized(exc):
             raise
+        if is_forti_forbidden(exc):
+            LOG.warning("Forti IP pool query forbidden for %s: %s", path, exc)
+            return []
         LOG.warning("Forti IP pool query failed for %s: %s", path, exc)
         return []
 
@@ -1851,7 +1873,7 @@ def sync_forti_public_ip_to_netbox(nb) -> None:
         ippool4_records = collect_forti_ippool_records(client, vdom, family=4)
         ippool6_records = collect_forti_ippool_records(client, vdom, family=6)
     except Exception as exc:
-        if is_forti_auth_error(exc):
+        if is_forti_unauthorized(exc):
             LOG.error("Skipping Forti public IP sync: authentication failed: %s", exc)
             return
         raise
