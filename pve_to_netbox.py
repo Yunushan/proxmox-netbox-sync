@@ -344,6 +344,7 @@ NODE_ILO_NPM_PREFIX_ENV = "PVE_NODE_ILO_NPM_PREFIX"
 NODE_ILO_DOMAIN_SUFFIXES_ENV = "PVE_NODE_ILO_DOMAIN_SUFFIXES"
 IP_BLOCK_REPORT_ENV = "PVE_NB_IP_BLOCK_REPORT"
 IP_BLOCK_REPORT_PATH_ENV = "PVE_NB_IP_BLOCK_REPORT_PATH"
+PREFIX_SYNC_ENV = "PVE_NB_PREFIX_SYNC"
 PVE_API_TIMEOUT_ENV = "PVE_API_TIMEOUT"
 FORTI_PUBLIC_IP_SYNC_ENV = "PVE_FORTI_PUBLIC_IP_SYNC"
 FORTI_URL_ENV = "PVE_FORTI_URL"
@@ -359,6 +360,9 @@ NB_FORTI_DEVICE_ENV = "NB_FORTI_DEVICE"
 NB_FORTI_INTERFACE_ENV = "NB_FORTI_INTERFACE"
 NB_FORTI_SET_PRIMARY_ENV = "NB_FORTI_SET_PRIMARY"
 NB_FORTI_SET_PRIMARY6_ENV = "NB_FORTI_SET_PRIMARY6"
+
+
+PREFIX_SYNC_DISABLED_REASON: Optional[str] = None
 
 
 def parse_sync_mode(value: str) -> str:
@@ -2980,6 +2984,122 @@ def get_or_create_vlan(nb, vid: int, site) -> object:
     return vlan
 
 
+def select_existing_prefix_candidate(
+    candidates: List[object],
+    prefix_cidr: str,
+    vlan_obj,
+) -> Optional[object]:
+    exact_candidates = [
+        candidate
+        for candidate in candidates
+        if str(getattr(candidate, "prefix", "") or "").strip() == prefix_cidr
+    ]
+    if not exact_candidates:
+        return None
+
+    target_vlan_id = get_related_object_id(vlan_obj)
+    if target_vlan_id is not None:
+        for candidate in exact_candidates:
+            if get_related_object_id(getattr(candidate, "vlan", None)) == target_vlan_id:
+                return candidate
+
+    if len(exact_candidates) > 1:
+        LOG.warning(
+            "Prefix %s has %d records in NetBox; using id=%s and leaving others untouched",
+            prefix_cidr,
+            len(exact_candidates),
+            getattr(exact_candidates[0], "id", "?"),
+        )
+    return exact_candidates[0]
+
+
+def should_sync_guest_prefix(prefix: int, family: int, prefix_is_fallback: bool) -> bool:
+    max_prefix = 128 if family == 6 else 32
+    if prefix_is_fallback and prefix == max_prefix:
+        return False
+    return True
+
+
+def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]:
+    if parse_bool(env(PREFIX_SYNC_ENV, "true")) is False:
+        return None
+    if PREFIX_SYNC_DISABLED_REASON is not None:
+        return None
+
+    try:
+        prefix_cidr = str(ipaddress.ip_network(cidr, strict=False))
+    except ValueError:
+        return None
+
+    query = {"prefix": prefix_cidr}
+    if site and getattr(site, "id", None):
+        query["site_id"] = site.id
+
+    try:
+        candidates = list(nb.ipam.prefixes.filter(**query))
+    except RequestError as exc:
+        status = request_error_status_code(exc)
+        if status in (401, 403):
+            disable_prefix_sync_for_run(f"NetBox returned {status} while querying prefixes")
+            return None
+        if status and 500 <= status < 600:
+            LOG.warning(
+                "NetBox returned %s while searching for prefix %s; skipping prefix sync",
+                status,
+                prefix_cidr,
+            )
+            return None
+        LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
+        return None
+    except Exception as exc:
+        LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
+        return None
+
+    prefix_obj = select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
+    if prefix_obj:
+        return prefix_obj
+
+    data = {
+        "prefix": prefix_cidr,
+        "status": "active",
+    }
+    if site:
+        data["site"] = site.id
+
+    vlan_id = get_related_object_id(vlan_obj)
+    if vlan_id is not None:
+        data["vlan"] = vlan_id
+
+    LOG.info("Creating NetBox prefix %s", prefix_cidr)
+    try:
+        return nb.ipam.prefixes.create(data)
+    except RequestError as exc:
+        status = request_error_status_code(exc)
+        err_text = str(getattr(exc, "error", exc))
+        if "duplicate" in err_text.lower():
+            LOG.warning("Prefix %s already exists in NetBox; leaving existing record untouched", prefix_cidr)
+            try:
+                candidates = list(nb.ipam.prefixes.filter(**query))
+            except Exception:
+                return None
+            return select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
+        if status in (401, 403):
+            disable_prefix_sync_for_run(f"NetBox returned {status} while creating prefixes")
+            return None
+        if status and 500 <= status < 600:
+            LOG.warning(
+                "NetBox returned %s while creating prefix %s; skipping prefix sync",
+                status,
+                prefix_cidr,
+            )
+            return None
+        LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
+        return None
+    except Exception as exc:
+        LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
+        return None
+
+
 MAC_ADDRESS_RE = re.compile(r"^[0-9A-F]{12}$")
 PVE_NIC_MAC_KEYS = {
     "virtio",
@@ -3808,18 +3928,14 @@ def parse_guest_ip_prefix(prefix: Optional[object], ip: str) -> Optional[int]:
     return None
 
 
-def get_guest_interface_name(
-    proxmox: ProxmoxAPI,
-    node_name: str,
-    vmid: int,
-    pve_type: str,
+def get_guest_interface_name_from_payload(
+    interfaces: List[dict],
     nic_mac: Optional[str],
 ) -> Optional[str]:
     """
     Use guest agent to find the OS-level interface name (e.g. enp6s18) that
     corresponds to our NIC MAC. Fallback: first non-lo interface with an IP.
     """
-    interfaces = fetch_guest_agent_interfaces(proxmox, node_name, vmid, pve_type)
     if not interfaces:
         return None
 
@@ -3827,8 +3943,8 @@ def get_guest_interface_name(
     fallback = None
 
     for iface in interfaces:
-        name = iface.get("name")
-        hw = iface.get("hardware-address")
+        name = str(iface.get("name") or "").strip()
+        hw = normalize_mac_address(iface.get("hardware-address"))
         if not name or name == "lo":
             continue
 
@@ -3843,26 +3959,41 @@ def get_guest_interface_name(
     return fallback
 
 
-def fetch_guest_ips(
+def get_guest_interface_name(
     proxmox: ProxmoxAPI,
     node_name: str,
     vmid: int,
     pve_type: str,
-) -> List[Tuple[str, int, int]]:
+    nic_mac: Optional[str],
+) -> Optional[str]:
+    interfaces = fetch_guest_agent_interfaces(proxmox, node_name, vmid, pve_type)
+    return get_guest_interface_name_from_payload(interfaces, nic_mac)
+
+
+def fetch_guest_ip_details(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+    interfaces: Optional[List[dict]] = None,
+) -> List[Dict[str, object]]:
     """
     Use qemu-guest-agent to fetch IP addresses from the guest.
 
-    Returns list of tuples: (ip, prefix, family) where family is 4 or 6.
-    Only implemented for QEMU guests; LXC returns [] for now.
+    Returns dicts with ip/prefix/family plus guest interface metadata when
+    available. Only implemented for QEMU guests; LXC returns [] for now.
     """
-    interfaces = fetch_guest_agent_interfaces(proxmox, node_name, vmid, pve_type)
+    if interfaces is None:
+        interfaces = fetch_guest_agent_interfaces(proxmox, node_name, vmid, pve_type)
     if not interfaces:
         return []
 
-    ips: List[Tuple[str, int, int]] = []
+    ips: List[Dict[str, object]] = []
     seen: Set[Tuple[str, int, int]] = set()
 
     for iface in interfaces:
+        guest_name = str(iface.get("name") or "").strip() or None
+        guest_mac = normalize_mac_address(iface.get("hardware-address"))
         ip_infos = iface.get("ip-addresses")
         if not isinstance(ip_infos, list):
             continue
@@ -3901,22 +4032,55 @@ def fetch_guest_ips(
             if ip_obj.version != family:
                 continue
 
-            prefix_int = parse_guest_ip_prefix(ip_info.get("prefix"), ip)
+            prefix_raw = ip_info.get("prefix")
+            prefix_int = parse_guest_ip_prefix(prefix_raw, ip)
             if prefix_int is None:
                 LOG.warning(
                     "Guest agent returned invalid prefix %r for IP %s on vmid=%s; skipping",
-                    ip_info.get("prefix"),
+                    prefix_raw,
                     ip,
                     vmid,
                 )
                 continue
 
             item = (ip, prefix_int, family)
-            if item not in seen:
-                seen.add(item)
-                ips.append(item)
+            if item in seen:
+                continue
+
+            seen.add(item)
+            ips.append(
+                {
+                    "ip": ip,
+                    "prefix": prefix_int,
+                    "family": family,
+                    "guest_name": guest_name,
+                    "mac": guest_mac,
+                    "prefix_is_fallback": prefix_raw is None
+                    or (isinstance(prefix_raw, str) and not prefix_raw.strip()),
+                }
+            )
 
     return ips
+
+
+def fetch_guest_ips(
+    proxmox: ProxmoxAPI,
+    node_name: str,
+    vmid: int,
+    pve_type: str,
+) -> List[Tuple[str, int, int]]:
+    return [
+        (str(item["ip"]), int(item["prefix"]), int(item["family"]))
+        for item in fetch_guest_ip_details(proxmox, node_name, vmid, pve_type)
+    ]
+
+
+def disable_prefix_sync_for_run(reason: str) -> None:
+    global PREFIX_SYNC_DISABLED_REASON
+    if PREFIX_SYNC_DISABLED_REASON is not None:
+        return
+    PREFIX_SYNC_DISABLED_REASON = reason
+    LOG.warning("Prefix sync disabled for this run: %s", reason)
 
 
 # ---------------------------------------------------------------------------
@@ -4762,7 +4926,8 @@ def ensure_vm_interface_and_ips(
     config: Optional[dict] = None,
 ):
     """
-    Ensure VM has a vminterface with correct MAC/VLAN and assign IP addresses.
+    Ensure VM has a vminterface with correct MAC/VLAN, assign IP addresses,
+    and create guest prefixes when possible.
 
     VLANs are auto-created when needed.
     IPs come from qemu-guest-agent for QEMU guests.
@@ -4777,8 +4942,15 @@ def ensure_vm_interface_and_ips(
     if not nic_infos:
         nic_infos = [parse_vm_nic_config(config.get("net0", ""), nic_name="net0")]
 
-    primary_iface = None
-    primary_iface_name = None
+    guest_interfaces = fetch_guest_agent_interfaces(proxmox, node_name, vmid, pve_type)
+    primary_record = None
+    iface_records_by_mac: Dict[str, Dict[str, object]] = {}
+    iface_records_by_name: Dict[str, Dict[str, object]] = {}
+
+    def remember_iface_name(name_value: Optional[object], record: Dict[str, object]) -> None:
+        name_key = str(name_value or "").strip().lower()
+        if name_key and name_key not in iface_records_by_name:
+            iface_records_by_name[name_key] = record
 
     for nic_info in nic_infos:
         mac = normalize_mac_address(nic_info.get("mac"))
@@ -4788,7 +4960,7 @@ def ensure_vm_interface_and_ips(
         # Use guest agent name only when NIC MAC is known; this avoids guessing wrong mappings.
         guest_name = None
         if mac:
-            guest_name = get_guest_interface_name(proxmox, node_name, vmid, pve_type, mac)
+            guest_name = get_guest_interface_name_from_payload(guest_interfaces, mac)
         iface_name = guest_name or source_iface_name
 
         iface = nb.virtualization.interfaces.get(
@@ -4859,26 +5031,66 @@ def ensure_vm_interface_and_ips(
                     mac,
                 )
 
-        if iface and primary_iface is None:
-            primary_iface = iface
-            primary_iface_name = iface_name
+        if iface:
+            record = {
+                "iface": iface,
+                "iface_name": iface_name,
+                "source_iface_name": source_iface_name,
+                "guest_name": guest_name,
+                "mac": mac,
+                "vlan_obj": vlan_obj,
+            }
+            if primary_record is None:
+                primary_record = record
+            if mac:
+                iface_records_by_mac[mac] = record
+            remember_iface_name(iface_name, record)
+            remember_iface_name(guest_name, record)
+            remember_iface_name(source_iface_name, record)
 
-    if primary_iface is None:
+    if primary_record is None:
         return
 
-    # Keep existing behavior: attach discovered guest IPs to the first VM NIC.
-    iface = primary_iface
-    iface_name = primary_iface_name or "net0"
-
     # Fetch IPs from guest (QEMU only for now)
-    ips = fetch_guest_ips(proxmox, node_name, vmid, pve_type)
-    if not ips:
+    ip_details = fetch_guest_ip_details(
+        proxmox,
+        node_name,
+        vmid,
+        pve_type,
+        interfaces=guest_interfaces,
+    )
+    if not ip_details:
         return
 
     primary_v4 = None
     primary_v6 = None
 
-    for ip, prefix, family in ips:
+    for item in ip_details:
+        target_record = None
+
+        item_mac = normalize_mac_address(item.get("mac"))
+        if item_mac:
+            target_record = iface_records_by_mac.get(item_mac)
+
+        if not target_record:
+            guest_name_key = str(item.get("guest_name") or "").strip().lower()
+            if guest_name_key:
+                target_record = iface_records_by_name.get(guest_name_key)
+
+        if not target_record:
+            target_record = primary_record
+
+        iface = target_record["iface"]
+        iface_name = str(
+            target_record.get("iface_name")
+            or target_record.get("source_iface_name")
+            or "net0"
+        )
+        vlan_obj = target_record.get("vlan_obj")
+        ip = str(item["ip"])
+        prefix = int(item["prefix"])
+        family = int(item["family"])
+        prefix_is_fallback = bool(item.get("prefix_is_fallback"))
         cidr = f"{ip}/{prefix}"
         ip_obj = None
 
@@ -4908,6 +5120,9 @@ def ensure_vm_interface_and_ips(
         except ValueError as exc:
             LOG.warning("Invalid IP %s (%s); skipping", cidr, exc)
             continue
+
+        if should_sync_guest_prefix(prefix, family, prefix_is_fallback):
+            ensure_netbox_prefix(nb, cidr, site, vlan_obj)
 
         # Try exact address match (may return multiple if duplicates exist)
         exact_candidates = list(nb.ipam.ip_addresses.filter(address=cidr))

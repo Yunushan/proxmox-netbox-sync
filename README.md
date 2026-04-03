@@ -1,6 +1,6 @@
 # Proxmox to NetBox Sync
 
-Sync Proxmox VE nodes, VMs, interfaces, VLANs, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, and VLANs are auto-created (optionally scoped to a site). Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field. Optionally, the script can also read Forti public IPs (IPv4/IPv6) and sync them into a NetBox device interface.
+Sync Proxmox VE nodes, VMs, interfaces, VLANs, prefixes, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, VLANs are auto-created (optionally scoped to a site), and guest CIDRs are created as NetBox prefixes when missing. Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field. Optionally, the script can also read Forti public IPs (IPv4/IPv6) and sync them into a NetBox device interface.
 
 ## Requirements
 
@@ -33,6 +33,7 @@ pip install proxmoxer pynetbox requests
    - `NB_URL`, `NB_TOKEN`, `NB_VERIFY_SSL`
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
   - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
+  - Optional prefix sync: `PVE_NB_PREFIX_SYNC` (defaults to `true`). Set `false` to disable NetBox prefix creation from guest CIDRs. Synthetic `/32` or `/128` fallbacks are not created as prefixes.
   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; auto-created and auto-attached to VMs if missing, requires NetBox custom field write permissions)
   - Optional VM gateway custom field keys: `NB_VM_GW4_CF` (defaults to `gateway4`), `NB_VM_GW6_CF` (defaults to `gateway6`). When enabled, the script stores gateway IPs from all LXC `netX` or QEMU cloud-init `ipconfigX` values; multiple gateways are stored as a comma-separated list. Set empty to disable. Requires NetBox custom field write permissions.
   - Optional VM metadata custom field keys (auto-created/attached if missing; set empty to disable; requires NetBox custom field write permissions). If you have duplicate fields, you can set a comma-separated list of keys to populate them all.
@@ -99,7 +100,7 @@ pip install proxmoxer pynetbox requests
 
 ### Sync modes
 
-- **Safe update** (default / `PVE_NB_SYNC_MODE=1`): Creates/updates VMs, interfaces, IPs. Nothing is removed from NetBox.
+- **Safe update** (default / `PVE_NB_SYNC_MODE=1`): Creates/updates VMs, interfaces, prefixes, and IPs. Nothing is removed from NetBox.
 - **Full sync** (`PVE_NB_SYNC_MODE=2`): After syncing, deletes NetBox VMs in the target cluster that are not present in Proxmox. Matching is name-based but also vmid-aware (vmid is stored in comments) to avoid deleting renamed VMs/templates.
   - Safety behavior: if VM enumeration fails on any node in a run, deletion is skipped for that run.
 
@@ -107,9 +108,9 @@ pip install proxmoxer pynetbox requests
 
 - **NetBox API token** (user or token-scoped permissions):
   - Virtualization: read/write `clusters`, `virtual-machines`, `interfaces`.
-  - IPAM: read/write `ip-addresses`, `vlans`.
+  - IPAM: read/write `ip-addresses`, `vlans`, `prefixes`.
   - DCIM: read/write `sites`, `devices`, `interfaces`, `device-roles`, `device-types`.
-  - If you prefer read-only sites/roles/types, grant read on those and write on the objects the tool creates/updates (VMs, interfaces, IPs, VLANs, devices).
+  - If you prefer read-only sites/roles/types, grant read on those and write on the objects the tool creates/updates (VMs, interfaces, prefixes, IPs, VLANs, devices).
 
 - **Proxmox API user/token** (recommended: dedicated service account with a custom role):
   - Minimum privileges: `VM.Audit`, `VM.Monitor` (to call guest-agent), `VM.Config.Options` (to read NIC config), `Sys.Audit` (to list nodes).

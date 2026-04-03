@@ -47,12 +47,13 @@ export NB_VERIFY_SSL="false"                 # Set true to verify TLS certs
 export PVE_NB_SYNC_MODE=""
 export PVE_ENV_FILE="netbox_pve_env.sh"     # Optional path for auto-updating env file defaults
 export PVE_GUEST_GW_FALLBACK="true" # Use guest-agent exec to fetch gateways from VM OS
+export PVE_NB_PREFIX_SYNC="true" # Optional bool. true => create missing NetBox prefixes from guest CIDRs
 export PVE_NB_IP_BLOCK_REPORT="false" # Optional bool. true => log NetBox prefix utilization report
 export PVE_NB_IP_BLOCK_REPORT_PATH="" # Optional CSV output path for prefix report (e.g. "/tmp/ip-block-report.csv")
 
 # NetBox objects
 export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slug
-export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices)
+export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices/prefixes)
 export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
 export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
 export NB_FORTI_DEVICE=""                    # Optional NetBox Forti device name or ID (defaults to Forti hostname)
