@@ -3020,6 +3020,60 @@ def should_sync_guest_prefix(prefix: int, family: int, prefix_is_fallback: bool)
     return True
 
 
+PREFIX_SCOPE_MODE: Optional[str] = None
+
+
+def get_prefix_scope_modes() -> List[str]:
+    preferred = PREFIX_SCOPE_MODE if PREFIX_SCOPE_MODE in ("scope", "site") else "scope"
+    modes = [preferred]
+    if preferred != "scope":
+        modes.append("scope")
+    if preferred != "site":
+        modes.append("site")
+    return modes
+
+
+def remember_prefix_scope_mode(mode: Optional[str]) -> None:
+    global PREFIX_SCOPE_MODE
+    if mode in ("scope", "site"):
+        PREFIX_SCOPE_MODE = mode
+
+
+def build_prefix_site_query(site, mode: Optional[str]) -> Dict[str, object]:
+    if not site or not getattr(site, "id", None):
+        return {}
+    if mode == "scope":
+        return {"scope_type": "dcim.site", "scope_id": site.id}
+    if mode == "site":
+        return {"site_id": site.id}
+    return {}
+
+
+def apply_prefix_site_create_fields(data: Dict[str, object], site, mode: Optional[str]) -> None:
+    if not site or not getattr(site, "id", None):
+        return
+    if mode == "scope":
+        data["scope_type"] = "dcim.site"
+        data["scope_id"] = site.id
+    elif mode == "site":
+        data["site"] = site.id
+
+
+def is_prefix_scope_compat_error(exc: RequestError, mode: Optional[str]) -> bool:
+    if mode not in ("scope", "site"):
+        return False
+    if request_error_status_code(exc) != 400:
+        return False
+
+    error_text = str(getattr(exc, "error", exc)).lower()
+    if not any(token in error_text for token in ("unknown", "invalid", "unexpected", "unsupported", "not a valid")):
+        return False
+
+    if mode == "scope":
+        return "scope_type" in error_text or "scope_id" in error_text or "'scope'" in error_text
+    return "site_id" in error_text or "'site'" in error_text
+
+
 def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]:
     if parse_bool(env(PREFIX_SYNC_ENV, "true")) is False:
         return None
@@ -3031,73 +3085,107 @@ def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]
     except ValueError:
         return None
 
-    query = {"prefix": prefix_cidr}
-    if site and getattr(site, "id", None):
-        query["site_id"] = site.id
+    query: Dict[str, object] = {"prefix": prefix_cidr}
+    candidates: Optional[List[object]] = None
+    query_mode: Optional[str] = None
 
-    try:
-        candidates = list(nb.ipam.prefixes.filter(**query))
-    except RequestError as exc:
-        status = request_error_status_code(exc)
-        if status in (401, 403):
-            disable_prefix_sync_for_run(f"NetBox returned {status} while querying prefixes")
+    for mode in get_prefix_scope_modes():
+        query = {"prefix": prefix_cidr}
+        query.update(build_prefix_site_query(site, mode))
+        try:
+            candidates = list(nb.ipam.prefixes.filter(**query))
+            query_mode = mode
+            remember_prefix_scope_mode(mode)
+            break
+        except RequestError as exc:
+            if build_prefix_site_query(site, mode) and is_prefix_scope_compat_error(exc, mode):
+                continue
+
+            status = request_error_status_code(exc)
+            if status in (401, 403):
+                disable_prefix_sync_for_run(f"NetBox returned {status} while querying prefixes")
+                return None
+            if status and 500 <= status < 600:
+                LOG.warning(
+                    "NetBox returned %s while searching for prefix %s; skipping prefix sync",
+                    status,
+                    prefix_cidr,
+                )
+                return None
+            LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
             return None
-        if status and 500 <= status < 600:
-            LOG.warning(
-                "NetBox returned %s while searching for prefix %s; skipping prefix sync",
-                status,
-                prefix_cidr,
-            )
+        except Exception as exc:
+            LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
             return None
-        LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
-        return None
-    except Exception as exc:
-        LOG.warning("Failed to query NetBox prefixes for %s: %s", prefix_cidr, exc)
+
+    if candidates is None:
+        LOG.warning(
+            "Failed to query NetBox prefixes for %s: no compatible site/scope filter accepted by API",
+            prefix_cidr,
+        )
         return None
 
     prefix_obj = select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
     if prefix_obj:
         return prefix_obj
 
-    data = {
-        "prefix": prefix_cidr,
-        "status": "active",
-    }
-    if site:
-        data["site"] = site.id
-
     vlan_id = get_related_object_id(vlan_obj)
-    if vlan_id is not None:
-        data["vlan"] = vlan_id
 
     LOG.info("Creating NetBox prefix %s", prefix_cidr)
-    try:
-        return nb.ipam.prefixes.create(data)
-    except RequestError as exc:
-        status = request_error_status_code(exc)
-        err_text = str(getattr(exc, "error", exc))
-        if "duplicate" in err_text.lower():
-            LOG.warning("Prefix %s already exists in NetBox; leaving existing record untouched", prefix_cidr)
-            try:
-                candidates = list(nb.ipam.prefixes.filter(**query))
-            except Exception:
+    create_modes = [query_mode] if query_mode else []
+    for mode in get_prefix_scope_modes():
+        if mode not in create_modes:
+            create_modes.append(mode)
+
+    for mode in create_modes:
+        data = {
+            "prefix": prefix_cidr,
+            "status": "active",
+        }
+        apply_prefix_site_create_fields(data, site, mode)
+        if vlan_id is not None:
+            data["vlan"] = vlan_id
+
+        try:
+            prefix_obj = nb.ipam.prefixes.create(data)
+            remember_prefix_scope_mode(mode)
+            return prefix_obj
+        except RequestError as exc:
+            if build_prefix_site_query(site, mode) and is_prefix_scope_compat_error(exc, mode):
+                continue
+
+            status = request_error_status_code(exc)
+            err_text = str(getattr(exc, "error", exc))
+            if "duplicate" in err_text.lower():
+                LOG.warning("Prefix %s already exists in NetBox; leaving existing record untouched", prefix_cidr)
+                try:
+                    duplicate_query = {"prefix": prefix_cidr}
+                    duplicate_query.update(build_prefix_site_query(site, mode))
+                    candidates = list(nb.ipam.prefixes.filter(**duplicate_query))
+                except Exception:
+                    return None
+                return select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
+            if status in (401, 403):
+                disable_prefix_sync_for_run(f"NetBox returned {status} while creating prefixes")
                 return None
-            return select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
-        if status in (401, 403):
-            disable_prefix_sync_for_run(f"NetBox returned {status} while creating prefixes")
+            if status and 500 <= status < 600:
+                LOG.warning(
+                    "NetBox returned %s while creating prefix %s; skipping prefix sync",
+                    status,
+                    prefix_cidr,
+                )
+                return None
+            LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
             return None
-        if status and 500 <= status < 600:
-            LOG.warning(
-                "NetBox returned %s while creating prefix %s; skipping prefix sync",
-                status,
-                prefix_cidr,
-            )
+        except Exception as exc:
+            LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
             return None
-        LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
-        return None
-    except Exception as exc:
-        LOG.warning("Failed to create NetBox prefix %s: %s", prefix_cidr, exc)
-        return None
+
+    LOG.warning(
+        "Failed to create NetBox prefix %s: no compatible site/scope payload accepted by API",
+        prefix_cidr,
+    )
+    return None
 
 
 MAC_ADDRESS_RE = re.compile(r"^[0-9A-F]{12}$")
@@ -5715,10 +5803,25 @@ def describe_related_value(value: Optional[object]) -> str:
 
 def build_ip_block_report_rows(nb, site) -> List[dict]:
     query: Dict[str, object] = {}
-    if site and getattr(site, "id", None):
-        query["site_id"] = site.id
+    prefixes: List[object] = []
+    query_attempted = False
 
-    prefixes = list(nb.ipam.prefixes.filter(**query))
+    for mode in get_prefix_scope_modes():
+        query = {}
+        query.update(build_prefix_site_query(site, mode))
+        try:
+            prefixes = list(nb.ipam.prefixes.filter(**query))
+            remember_prefix_scope_mode(mode)
+            query_attempted = True
+            break
+        except RequestError as exc:
+            if build_prefix_site_query(site, mode) and is_prefix_scope_compat_error(exc, mode):
+                continue
+            raise
+
+    if not query_attempted:
+        prefixes = list(nb.ipam.prefixes.filter())
+
     rows: List[dict] = []
 
     for prefix in prefixes:
@@ -5762,7 +5865,9 @@ def build_ip_block_report_rows(nb, site) -> List[dict]:
                 "prefix": prefix_cidr,
                 "family": network.version,
                 "prefix_length": network.prefixlen,
-                "site": describe_related_value(getattr(prefix, "site", None)),
+                "site": describe_related_value(
+                    getattr(prefix, "scope", None) or getattr(prefix, "site", None)
+                ),
                 "vrf": describe_related_value(getattr(prefix, "vrf", None)),
                 "vlan": vlan_value,
                 "status": describe_related_value(getattr(prefix, "status", None)),
