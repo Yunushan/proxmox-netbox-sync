@@ -360,6 +360,8 @@ NB_FORTI_DEVICE_ENV = "NB_FORTI_DEVICE"
 NB_FORTI_INTERFACE_ENV = "NB_FORTI_INTERFACE"
 NB_FORTI_SET_PRIMARY_ENV = "NB_FORTI_SET_PRIMARY"
 NB_FORTI_SET_PRIMARY6_ENV = "NB_FORTI_SET_PRIMARY6"
+NB_PREFIX_ROLE_ENV = "NB_PREFIX_ROLE_SLUG"
+NB_VLAN_ROLE_ENV = "NB_VLAN_ROLE_SLUG"
 
 
 PREFIX_SYNC_DISABLED_REASON: Optional[str] = None
@@ -549,6 +551,52 @@ def get_nb_device_type(nb):
     if not dtype:
         raise SystemExit(f"NetBox device type with slug '{dtype_slug}' not found")
     return dtype
+
+
+def format_slug_label(value: str) -> str:
+    text = re.sub(r"[-_]+", " ", (value or "").strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.title() if text else ""
+
+
+def ensure_nb_ipam_role(nb, env_var: str) -> Optional[object]:
+    role_slug_raw = env(env_var)
+    if not role_slug_raw:
+        return None
+
+    role_slug = slugify_tag(role_slug_raw)
+    if not role_slug:
+        raise SystemExit(f"Environment variable {env_var} does not contain a valid role slug")
+
+    try:
+        role = nb.ipam.roles.get(slug=role_slug)
+    except RequestError as exc:
+        raise SystemExit(f"Failed to query NetBox IPAM role '{role_slug}': {exc}") from exc
+
+    if role:
+        return role
+
+    role_name = format_slug_label(role_slug_raw) or format_slug_label(role_slug) or role_slug
+    LOG.info("Creating NetBox IPAM role %s (slug=%s)", role_name, role_slug)
+    try:
+        role = nb.ipam.roles.create({"name": role_name, "slug": role_slug})
+    except RequestError as exc:
+        err_text = str(getattr(exc, "error", exc))
+        if "duplicate" in err_text.lower():
+            try:
+                role = nb.ipam.roles.get(slug=role_slug)
+            except RequestError as retry_exc:
+                raise SystemExit(
+                    f"NetBox reported duplicate while creating IPAM role '{role_slug}', "
+                    f"but re-query failed: {retry_exc}"
+                ) from retry_exc
+            if role:
+                return role
+        raise SystemExit(f"Failed to create NetBox IPAM role '{role_slug}': {exc}") from exc
+
+    if not role:
+        raise SystemExit(f"NetBox did not return created IPAM role '{role_slug}'")
+    return role
 
 
 # ---------------------------------------------------------------------------
@@ -2950,11 +2998,25 @@ def set_custom_field_value(
     custom_fields_data[spec["key"]] = casted
 
 
+def ensure_ipam_object_role(obj, role_obj, context: str) -> bool:
+    role_id = get_related_object_id(role_obj)
+    if role_id is None or obj is None:
+        return False
+
+    current_role_id = get_related_object_id(getattr(obj, "role", None))
+    if current_role_id == role_id:
+        return False
+
+    obj.role = role_id
+    save_netbox_object_with_retry(obj, context)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # VLAN + interface helpers
 # ---------------------------------------------------------------------------
 
-def get_or_create_vlan(nb, vid: int, site) -> object:
+def get_or_create_vlan(nb, vid: int, site, role_obj=None) -> object:
     """
     Get or create a VLAN with the given VID.
 
@@ -2969,6 +3031,7 @@ def get_or_create_vlan(nb, vid: int, site) -> object:
 
     vlan = nb.ipam.vlans.get(**query)
     if vlan:
+        ensure_ipam_object_role(vlan, role_obj, f"updating role on VLAN {vid}")
         return vlan
 
     vlan_name = f"VLAN{vid}"
@@ -2980,6 +3043,9 @@ def get_or_create_vlan(nb, vid: int, site) -> object:
     }
     if site:
         data["site"] = site.id
+    role_id = get_related_object_id(role_obj)
+    if role_id is not None:
+        data["role"] = role_id
     vlan = nb.ipam.vlans.create(data)
     return vlan
 
@@ -3074,7 +3140,7 @@ def is_prefix_scope_compat_error(exc: RequestError, mode: Optional[str]) -> bool
     return "site_id" in error_text or "'site'" in error_text
 
 
-def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]:
+def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None, role_obj=None) -> Optional[object]:
     if parse_bool(env(PREFIX_SYNC_ENV, "true")) is False:
         return None
     if PREFIX_SYNC_DISABLED_REASON is not None:
@@ -3127,9 +3193,11 @@ def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]
 
     prefix_obj = select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
     if prefix_obj:
+        ensure_ipam_object_role(prefix_obj, role_obj, f"updating role on prefix {prefix_cidr}")
         return prefix_obj
 
     vlan_id = get_related_object_id(vlan_obj)
+    role_id = get_related_object_id(role_obj)
 
     LOG.info("Creating NetBox prefix %s", prefix_cidr)
     create_modes = [query_mode] if query_mode else []
@@ -3145,6 +3213,8 @@ def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]
         apply_prefix_site_create_fields(data, site, mode)
         if vlan_id is not None:
             data["vlan"] = vlan_id
+        if role_id is not None:
+            data["role"] = role_id
 
         try:
             prefix_obj = nb.ipam.prefixes.create(data)
@@ -3164,7 +3234,10 @@ def ensure_netbox_prefix(nb, cidr: str, site, vlan_obj=None) -> Optional[object]
                     candidates = list(nb.ipam.prefixes.filter(**duplicate_query))
                 except Exception:
                     return None
-                return select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
+                prefix_obj = select_existing_prefix_candidate(candidates, prefix_cidr, vlan_obj)
+                if prefix_obj:
+                    ensure_ipam_object_role(prefix_obj, role_obj, f"updating role on prefix {prefix_cidr}")
+                return prefix_obj
             if status in (401, 403):
                 disable_prefix_sync_for_run(f"NetBox returned {status} while creating prefixes")
                 return None
@@ -5011,6 +5084,8 @@ def ensure_vm_interface_and_ips(
     pve_type: str,
     nb_vm,
     site,
+    prefix_role=None,
+    vlan_role=None,
     config: Optional[dict] = None,
 ):
     """
@@ -5078,7 +5153,7 @@ def ensure_vm_interface_and_ips(
 
         vlan_obj = None
         if vlan_vid is not None:
-            vlan_obj = get_or_create_vlan(nb, vlan_vid, site)
+            vlan_obj = get_or_create_vlan(nb, vlan_vid, site, vlan_role)
 
         if not iface:
             LOG.info("Creating NetBox VM interface %s on VM %s", iface_name, nb_vm.name)
@@ -5210,7 +5285,7 @@ def ensure_vm_interface_and_ips(
             continue
 
         if should_sync_guest_prefix(prefix, family, prefix_is_fallback):
-            ensure_netbox_prefix(nb, cidr, site, vlan_obj)
+            ensure_netbox_prefix(nb, cidr, site, vlan_obj, prefix_role)
 
         # Try exact address match (may return multiple if duplicates exist)
         exact_candidates = list(nb.ipam.ip_addresses.filter(address=cidr))
@@ -5349,6 +5424,8 @@ def sync_vms(
     cluster,
     node_devices: Dict[str, Optional[object]],
     site,
+    prefix_role,
+    vlan_role,
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
     vm_cf_specs: Dict[str, Optional[List[dict]]],
@@ -5414,6 +5491,8 @@ def sync_vms(
                     cluster=cluster,
                     pve_type=vm_kind,
                     site=site,
+                    prefix_role=prefix_role,
+                    vlan_role=vlan_role,
                     vmid_map=vmid_map,
                     vm_resource_map=vm_resource_map,
                     vm_cf_specs=vm_cf_specs,
@@ -5462,6 +5541,8 @@ def sync_single_vm(
     cluster,
     pve_type: str,
     site,
+    prefix_role,
+    vlan_role,
     vmid_map: Dict[int, object],
     vm_resource_map: Dict[int, dict],
     vm_cf_specs: Dict[str, Optional[List[dict]]],
@@ -5731,6 +5812,8 @@ def sync_single_vm(
         pve_type=pve_type,
         nb_vm=nb_vm,
         site=site,
+        prefix_role=prefix_role,
+        vlan_role=vlan_role,
         config=config,
     )
     return name, vmid
@@ -5983,6 +6066,8 @@ def main():
     site = get_nb_site(nb)
     role = get_nb_device_role(nb)
     dtype = get_nb_device_type(nb)
+    prefix_role = ensure_nb_ipam_role(nb, NB_PREFIX_ROLE_ENV)
+    vlan_role = ensure_nb_ipam_role(nb, NB_VLAN_ROLE_ENV)
     vm_cf_specs = resolve_vm_custom_field_specs(nb)
     sync_timestamp = format_sync_timestamp()
     vm_resource_map = build_vm_resource_map(proxmox)
@@ -5997,6 +6082,8 @@ def main():
         cluster,
         node_devices,
         site,
+        prefix_role,
+        vlan_role,
         vmid_map,
         vm_resource_map,
         vm_cf_specs,
