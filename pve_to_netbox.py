@@ -10,7 +10,7 @@ import base64
 import binascii
 import time
 from functools import lru_cache
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from typing import Dict, Optional, List, Tuple, Set
 
 import requests
@@ -483,6 +483,62 @@ def connect_netbox():
     return nb
 
 
+def build_netbox_api_root_url() -> str:
+    raw_url = (env("NB_URL", required=True) or "").strip()
+    parts = urlsplit(raw_url)
+    path = (parts.path or "").rstrip("/")
+    if not path.endswith("/api"):
+        path = f"{path}/api" if path else "/api"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def netbox_api_request(
+    nb,
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    payload: Optional[dict] = None,
+) -> Optional[object]:
+    session = getattr(nb, "http_session", None) or requests.Session()
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Token {env('NB_TOKEN', required=True)}",
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    url = f"{build_netbox_api_root_url().rstrip('/')}/{path.lstrip('/')}"
+    response = session.request(method, url, headers=headers, params=params, json=payload, timeout=30)
+    response.raise_for_status()
+
+    if response.status_code == 204:
+        return None
+
+    body = response.text.strip()
+    if not body:
+        return None
+
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def extract_netbox_results(payload: object) -> List[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list):
+            return [item for item in results if isinstance(item, dict)]
+
+        if all(key in payload for key in ("id", "name", "slug")):
+            return [payload]
+
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Per-node Proxmox connections (guest agent exec compatibility)
 # ---------------------------------------------------------------------------
@@ -559,44 +615,114 @@ def format_slug_label(value: str) -> str:
     return text.title() if text else ""
 
 
+def get_nb_ipam_role_by_slug(nb, role_slug: str) -> Optional[object]:
+    endpoint = getattr(getattr(nb, "ipam", None), "roles", None)
+    if endpoint is not None:
+        try:
+            role = endpoint.get(slug=role_slug)
+        except RequestError as exc:
+            LOG.debug("Pynetbox IPAM role lookup failed for slug=%s: %s", role_slug, exc)
+        except Exception as exc:
+            LOG.debug("Unexpected pynetbox IPAM role lookup failure for slug=%s: %s", role_slug, exc)
+        else:
+            if role:
+                return role
+
+        try:
+            matches = list(endpoint.filter(slug=role_slug))
+        except RequestError as exc:
+            LOG.debug("Pynetbox IPAM role filter failed for slug=%s: %s", role_slug, exc)
+        except Exception as exc:
+            LOG.debug("Unexpected pynetbox IPAM role filter failure for slug=%s: %s", role_slug, exc)
+        else:
+            if matches:
+                return matches[0]
+
+    try:
+        payload = netbox_api_request(nb, "GET", "/ipam/roles/", params={"slug": role_slug, "limit": 2})
+    except requests.RequestException as exc:
+        LOG.debug("Direct NetBox IPAM role lookup failed for slug=%s: %s", role_slug, exc)
+        return None
+
+    matches = extract_netbox_results(payload)
+    return matches[0] if matches else None
+
+
+def create_nb_ipam_role(nb, role_name: str, role_slug: str) -> Optional[object]:
+    endpoint = getattr(getattr(nb, "ipam", None), "roles", None)
+    if endpoint is not None:
+        try:
+            role = endpoint.create({"name": role_name, "slug": role_slug})
+        except RequestError as exc:
+            err_text = str(getattr(exc, "error", exc))
+            if request_error_status_code(exc) in (400, 409) or "duplicate" in err_text.lower():
+                role = get_nb_ipam_role_by_slug(nb, role_slug)
+                if role:
+                    return role
+            LOG.debug("Pynetbox IPAM role create failed for slug=%s: %s", role_slug, exc)
+        except Exception as exc:
+            LOG.debug("Unexpected pynetbox IPAM role create failure for slug=%s: %s", role_slug, exc)
+        else:
+            if role:
+                return role
+
+    try:
+        payload = netbox_api_request(
+            nb,
+            "POST",
+            "/ipam/roles/",
+            payload={"name": role_name, "slug": role_slug},
+        )
+    except requests.RequestException as exc:
+        LOG.debug("Direct NetBox IPAM role create failed for slug=%s: %s", role_slug, exc)
+    else:
+        matches = extract_netbox_results(payload)
+        if matches:
+            return matches[0]
+        if isinstance(payload, dict) and payload:
+            return payload
+
+    return get_nb_ipam_role_by_slug(nb, role_slug)
+
+
 def ensure_nb_ipam_role(nb, env_var: str) -> Optional[object]:
     role_slug_raw = env(env_var)
     if not role_slug_raw:
+        LOG.info("Skipping NetBox IPAM role sync for %s: variable is not set", env_var)
         return None
 
     role_slug = slugify_tag(role_slug_raw)
     if not role_slug:
-        raise SystemExit(f"Environment variable {env_var} does not contain a valid role slug")
-
-    try:
-        role = nb.ipam.roles.get(slug=role_slug)
-    except RequestError as exc:
-        raise SystemExit(f"Failed to query NetBox IPAM role '{role_slug}': {exc}") from exc
-
-    if role:
-        return role
+        LOG.warning(
+            "Skipping NetBox IPAM role sync for %s: value %r does not contain a valid slug",
+            env_var,
+            role_slug_raw,
+        )
+        return None
 
     role_name = format_slug_label(role_slug_raw) or format_slug_label(role_slug) or role_slug
-    LOG.info("Creating NetBox IPAM role %s (slug=%s)", role_name, role_slug)
-    try:
-        role = nb.ipam.roles.create({"name": role_name, "slug": role_slug})
-    except RequestError as exc:
-        err_text = str(getattr(exc, "error", exc))
-        if "duplicate" in err_text.lower():
-            try:
-                role = nb.ipam.roles.get(slug=role_slug)
-            except RequestError as retry_exc:
-                raise SystemExit(
-                    f"NetBox reported duplicate while creating IPAM role '{role_slug}', "
-                    f"but re-query failed: {retry_exc}"
-                ) from retry_exc
-            if role:
-                return role
-        raise SystemExit(f"Failed to create NetBox IPAM role '{role_slug}': {exc}") from exc
-
+    role = get_nb_ipam_role_by_slug(nb, role_slug)
     if not role:
-        raise SystemExit(f"NetBox did not return created IPAM role '{role_slug}'")
-    return role
+        LOG.info("Creating NetBox IPAM role %s (slug=%s)", role_name, role_slug)
+        role = create_nb_ipam_role(nb, role_name, role_slug)
+
+    if role:
+        LOG.info(
+            "Ensured NetBox IPAM role %s (slug=%s, id=%s) for %s",
+            role_name,
+            role_slug,
+            get_related_object_id(role),
+            env_var,
+        )
+        return role
+
+    LOG.warning(
+        "Failed to ensure NetBox IPAM role %s (slug=%s) for %s; continuing without role sync",
+        role_name,
+        role_slug,
+        env_var,
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
