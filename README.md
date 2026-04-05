@@ -1,6 +1,32 @@
+<div align="center">
+
 # Proxmox to NetBox Sync
 
-Sync Proxmox VE nodes, VMs, interfaces, VLANs, prefixes, and IP addresses into NetBox with a single script. Guest IPs are pulled via the QEMU guest agent when available, VLANs are auto-created (optionally scoped to a site), and guest CIDRs are created as NetBox prefixes when missing. Optional default IPAM roles can be auto-created and applied to synced VLANs and prefixes. Proxmox VM tags are mirrored to NetBox tags, and VM pools can be stored in a NetBox custom field. Optionally, the script can also read Forti public IPs (IPv4/IPv6) and sync them into a NetBox device interface.
+**Single-script Proxmox VE to NetBox synchronization for nodes, VMs, interfaces, VLANs, prefixes, IP addresses, iLO/OOB management, and optional Forti public IP data.**
+
+<p>
+  <img src="https://img.shields.io/badge/python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/proxmox-VE-E57000?style=for-the-badge&logo=proxmox&logoColor=white" alt="Proxmox VE">
+  <img src="https://img.shields.io/badge/netbox-IPAM%20%26%20Inventory-2E7D32?style=for-the-badge" alt="NetBox">
+  <img src="https://img.shields.io/badge/sync-VMs%20%7C%20Interfaces%20%7C%20IPAM-0A66C2?style=for-the-badge" alt="Sync coverage">
+  <img src="https://img.shields.io/badge/systemd-friendly-4C566A?style=for-the-badge" alt="systemd friendly">
+  <img src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" alt="MIT license">
+</p>
+
+<p>
+  <a href="#install">Quick Start</a> •
+  <a href="#configure">Configure</a> •
+  <a href="#required-api-permissions">Permissions</a> •
+  <a href="#run-once-manual">Run Once</a> •
+  <a href="#run-as-a-systemd-service--timer">systemd</a>
+</p>
+
+</div>
+
+This project pulls runtime and guest-network data from Proxmox and writes it into NetBox in a way that is practical for homelab, SMB, and internal infrastructure environments. It can create missing VLANs and prefixes, mirror VM tags, store VM pools/custom metadata, sync node iLO/OOB addresses, and optionally ingest Forti public IPv4/IPv6 assignments into a NetBox device interface.
+
+> [!IMPORTANT]
+> The script is designed to keep NetBox aligned with Proxmox and related edge data sources. It is not trying to become a full CMDB/orchestration platform, and it does not manage every possible Proxmox or NetBox object type.
 
 ## Requirements
 
@@ -34,7 +60,7 @@ pip install proxmoxer pynetbox requests
    - `NB_CLUSTER_SLUG` (target virtualization cluster)
   - Optional device metadata: `NB_SITE_SLUG`, `NB_DEVICE_ROLE_SLUG`, `NB_DEVICE_TYPE_SLUG`
   - Optional prefix sync: `PVE_NB_PREFIX_SYNC` (defaults to `true`). Set `false` to disable NetBox prefix creation from guest CIDRs. Synthetic `/32` or `/128` fallbacks are not created as prefixes.
-  - Optional IPAM role sync: `NB_PREFIX_ROLE_SLUG`, `NB_VLAN_ROLE_SLUG`. When set, the script auto-creates the role if needed and applies it to synced prefixes/VLANs on create and update.
+  - Optional IPAM role sync: `NB_PREFIX_ROLE_SLUG`, `NB_VLAN_ROLE_SLUG`. If unset or blank, the script auto-seeds `proxmox-prefix` / `proxmox-vlan`, writes them to the env file when possible, auto-creates the roles in NetBox if missing, and applies them to synced prefixes/VLANs. Set either variable to `off` to disable that role sync.
   - Optional VM pool custom field key: `NB_VM_POOL_CF` (defaults to `pool`; auto-created and auto-attached to VMs if missing, requires NetBox custom field write permissions)
   - Optional VM gateway custom field keys: `NB_VM_GW4_CF` (defaults to `gateway4`), `NB_VM_GW6_CF` (defaults to `gateway6`). When enabled, the script stores gateway IPs from all LXC `netX` or QEMU cloud-init `ipconfigX` values; multiple gateways are stored as a comma-separated list. Set empty to disable. Requires NetBox custom field write permissions.
   - Optional VM metadata custom field keys (auto-created/attached if missing; set empty to disable; requires NetBox custom field write permissions). If you have duplicate fields, you can set a comma-separated list of keys to populate them all.

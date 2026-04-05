@@ -295,7 +295,23 @@ def build_auto_node_ilo_candidates(node_name: str) -> List[str]:
     return candidates
 
 
-def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> None:
+def parse_env_assignment_value(line: str) -> str:
+    if "=" not in line:
+        return ""
+
+    _, raw_value = line.split("=", 1)
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value.strip()
+
+
+def ensure_env_file_setting(
+    env_file: Optional[str],
+    key: str,
+    value: str,
+    replace_blank: bool = False,
+) -> None:
     if not env_file:
         return
 
@@ -308,8 +324,23 @@ def ensure_env_file_setting(env_file: Optional[str], key: str, value: str) -> No
         LOG.debug("Failed to read env file %s: %s", env_file, exc)
         return
 
-    pattern = re.compile(rf"^\\s*(export\\s+)?{re.escape(key)}=", re.MULTILINE)
-    if pattern.search(contents):
+    pattern = re.compile(rf"^\s*(export\s+)?{re.escape(key)}=", re.MULTILINE)
+    lines = contents.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+
+        if not replace_blank or parse_env_assignment_value(line):
+            return
+
+        newline = "\n" if line.endswith("\n") else ""
+        lines[idx] = f'export {key}="{value}"{newline}'
+        try:
+            with open(env_file, "w", encoding="utf-8") as handle:
+                handle.write("".join(lines))
+            LOG.info("Updated blank %s in %s to %r", key, env_file, value)
+        except OSError as exc:
+            LOG.warning("Failed to update env file %s with %s: %s", env_file, key, exc)
         return
 
     try:
@@ -362,6 +393,8 @@ NB_FORTI_SET_PRIMARY_ENV = "NB_FORTI_SET_PRIMARY"
 NB_FORTI_SET_PRIMARY6_ENV = "NB_FORTI_SET_PRIMARY6"
 NB_PREFIX_ROLE_ENV = "NB_PREFIX_ROLE_SLUG"
 NB_VLAN_ROLE_ENV = "NB_VLAN_ROLE_SLUG"
+DEFAULT_NB_PREFIX_ROLE_SLUG = "proxmox-prefix"
+DEFAULT_NB_VLAN_ROLE_SLUG = "proxmox-vlan"
 
 
 PREFIX_SYNC_DISABLED_REASON: Optional[str] = None
@@ -615,6 +648,23 @@ def format_slug_label(value: str) -> str:
     return text.title() if text else ""
 
 
+def resolve_default_ipam_role_slug(env_var: str, default_slug: str) -> Optional[str]:
+    raw_value = os.environ.get(env_var)
+    if raw_value is not None:
+        normalized = raw_value.strip()
+        if normalized.lower() in ("off", "false", "disable", "disabled", "none", "no"):
+            LOG.info("Skipping NetBox IPAM role sync for %s: explicitly disabled (%s)", env_var, normalized)
+            return None
+        if normalized:
+            return normalized
+
+    env_file = env("PVE_ENV_FILE", "netbox_pve_env.sh")
+    ensure_env_file_setting(env_file, env_var, default_slug, replace_blank=True)
+    os.environ[env_var] = default_slug
+    LOG.info("Defaulting %s to %s", env_var, default_slug)
+    return default_slug
+
+
 def get_nb_ipam_role_by_slug(nb, role_slug: str) -> Optional[object]:
     endpoint = getattr(getattr(nb, "ipam", None), "roles", None)
     if endpoint is not None:
@@ -686,9 +736,9 @@ def create_nb_ipam_role(nb, role_name: str, role_slug: str) -> Optional[object]:
 
 
 def ensure_nb_ipam_role(nb, env_var: str) -> Optional[object]:
-    role_slug_raw = env(env_var)
+    default_slug = DEFAULT_NB_PREFIX_ROLE_SLUG if env_var == NB_PREFIX_ROLE_ENV else DEFAULT_NB_VLAN_ROLE_SLUG
+    role_slug_raw = resolve_default_ipam_role_slug(env_var, default_slug)
     if not role_slug_raw:
-        LOG.info("Skipping NetBox IPAM role sync for %s: variable is not set", env_var)
         return None
 
     role_slug = slugify_tag(role_slug_raw)

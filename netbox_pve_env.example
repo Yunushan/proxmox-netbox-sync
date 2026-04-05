@@ -54,8 +54,8 @@ export PVE_NB_IP_BLOCK_REPORT_PATH="" # Optional CSV output path for prefix repo
 # NetBox objects
 export NB_CLUSTER_SLUG="pve-cluster"         # Target virtualization cluster slug
 export NB_SITE_SLUG="lab"                    # Optional site slug (used for VLANs/devices/prefixes)
-export NB_PREFIX_ROLE_SLUG=""                # Optional IPAM prefix role slug; auto-created if missing and applied to synced prefixes
-export NB_VLAN_ROLE_SLUG=""                  # Optional IPAM VLAN role slug; auto-created if missing and applied to synced VLANs
+export NB_PREFIX_ROLE_SLUG=""                # Blank/unset auto-defaults to proxmox-prefix; set off to disable prefix role sync
+export NB_VLAN_ROLE_SLUG=""                  # Blank/unset auto-defaults to proxmox-vlan; set off to disable VLAN role sync
 export NB_DEVICE_ROLE_SLUG="hypervisor"      # Optional device role for nodes
 export NB_DEVICE_TYPE_SLUG="proxmox-node"    # Optional device type for nodes
 export NB_FORTI_DEVICE=""                    # Optional NetBox Forti device name or ID (defaults to Forti hostname)
