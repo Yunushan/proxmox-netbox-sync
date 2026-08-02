@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/netbox-IPAM%20%26%20Inventory-2E7D32?style=for-the-badge" alt="NetBox">
   <img src="https://img.shields.io/badge/sync-VMs%20%7C%20Interfaces%20%7C%20IPAM-0A66C2?style=for-the-badge" alt="Sync coverage">
   <img src="https://img.shields.io/badge/systemd-friendly-4C566A?style=for-the-badge" alt="systemd friendly">
-  <img src="https://img.shields.io/badge/license-MIT-111111?style=for-the-badge" alt="MIT license">
+  <img src="https://img.shields.io/badge/license-0BSD-111111?style=for-the-badge" alt="0BSD license">
 </p>
 
 <p>
