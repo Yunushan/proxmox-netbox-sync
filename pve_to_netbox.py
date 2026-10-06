@@ -3615,14 +3615,23 @@ def parse_vm_nic_config(net_value: Optional[object], nic_name: str = "net0") -> 
 
         virtio=BC:24:11:44:E6:98,bridge=vmbr0,tag=500
 
-    Returns dict with keys: name, mac, bridge, vlan.
+    Returns dict with keys: name, mac, bridge, vlan, ip, ip6.
     """
     if not net_value:
-        return {"name": nic_name, "mac": None, "bridge": None, "vlan": None}
+        return {
+            "name": nic_name,
+            "mac": None,
+            "bridge": None,
+            "vlan": None,
+            "ip": None,
+            "ip6": None,
+        }
 
     mac = None
     bridge = None
     vlan = None
+    ip = None
+    ip6 = None
 
     for part in str(net_value).split(","):
         part = part.strip()
@@ -3632,9 +3641,11 @@ def parse_vm_nic_config(net_value: Optional[object], nic_name: str = "net0") -> 
             if mac is None:
                 mac = normalize_mac_address(part)
             continue
+
         key, val = part.split("=", 1)
         key = key.strip().lower()
         val = val.strip()
+
         if not val:
             continue
 
@@ -3648,13 +3659,25 @@ def parse_vm_nic_config(net_value: Optional[object], nic_name: str = "net0") -> 
             parsed_vlan = parse_int(val)
             if parsed_vlan is not None and 1 <= parsed_vlan <= 4094:
                 vlan = parsed_vlan
+        elif key == "ip":
+            if val.lower() not in ("dhcp", "manual"):
+                ip = val
+        elif key == "ip6":
+            if val.lower() not in ("dhcp", "auto", "manual"):
+                ip6 = val
         elif mac is None:
             parsed_mac = normalize_mac_address(val)
             if parsed_mac:
                 mac = parsed_mac
 
-    return {"name": nic_name, "mac": mac, "bridge": bridge, "vlan": vlan}
-
+    return {
+        "name": nic_name,
+        "mac": mac,
+        "bridge": bridge,
+        "vlan": vlan,
+        "ip": ip,
+        "ip6": ip6,
+    }
 
 def extract_vm_nic_configs(config: Optional[dict]) -> List[Dict[str, Optional[object]]]:
     if not isinstance(config, dict):
@@ -5390,14 +5413,59 @@ def ensure_vm_interface_and_ips(
     if primary_record is None:
         return
 
-    # Fetch IPs from guest (QEMU only for now)
-    ip_details = fetch_guest_ip_details(
-        proxmox,
-        node_name,
-        vmid,
-        pve_type,
-        interfaces=guest_interfaces,
-    )
+    # QEMU: keep original qemu-guest-agent behaviour.
+    # LXC: get static addresses directly from net0/net1/etc.
+    if pve_type == "lxc":
+        ip_details = []
+
+        for nic_info in nic_infos:
+            source_iface_name = (
+                str(nic_info.get("name") or "net0").strip() or "net0"
+            )
+
+            mac = normalize_mac_address(nic_info.get("mac"))
+
+            for address_key, family in (("ip", 4), ("ip6", 6)):
+                configured_cidr = nic_info.get(address_key)
+
+                if not configured_cidr:
+                    continue
+
+                try:
+                    parsed = ipaddress.ip_interface(str(configured_cidr))
+                except ValueError as exc:
+                    LOG.warning(
+                        "Invalid LXC IP %s on VM %s interface %s: %s",
+                        configured_cidr,
+                        nb_vm.name,
+                        source_iface_name,
+                        exc,
+                    )
+                    continue
+
+                if parsed.version != family:
+                    continue
+
+                ip_details.append(
+                    {
+                        "ip": str(parsed.ip),
+                        "prefix": parsed.network.prefixlen,
+                        "family": parsed.version,
+                        "mac": mac,
+                        "guest_name": source_iface_name,
+                        "prefix_is_fallback": False,
+                    }
+                )
+
+    else:
+        ip_details = fetch_guest_ip_details(
+            proxmox,
+            node_name,
+            vmid,
+            pve_type,
+            interfaces=guest_interfaces,
+        )
+
     if not ip_details:
         return
 
