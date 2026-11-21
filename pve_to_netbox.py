@@ -5445,6 +5445,9 @@ def ensure_vm_interface_and_ips(
 
                 if parsed.version != family:
                     continue
+                # Match guest-agent filtering before creating prefixes or choosing primary IPs.
+                if parsed.ip.is_loopback or (family == 6 and parsed.ip.is_link_local):
+                    continue
 
                 ip_details.append(
                     {
